@@ -1600,6 +1600,16 @@ public class MainActivity extends Activity {
         // 不摘掉的话 Activity 会被 Shizuku 的静态 listener 一直持有，造成泄漏
         Shizuku.removeRequestPermissionResultListener(mPermListener);
         Shizuku.removeBinderReceivedListener(mBinderListener);
+        // 下载完成广播同理：不反注册会一直挂着这个 Activity
+        // 注意这里只能改现有的 onDestroy，不能再新写一个同名方法 ——
+        // 一个 Activity 里只能有一个 onDestroy，写两个是重复定义，编译不过
+        if (mDlReceiverReg) {
+            try {
+                unregisterReceiver(mDlReceiver);
+            } catch (Exception ignored) {
+            }
+            mDlReceiverReg = false;
+        }
         super.onDestroy();
     }
 
@@ -2716,19 +2726,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    @Override
-    protected void onDestroy() {
-        // Activity 销毁时一定要反注册，否则 receiver 会一直挂着它，造成泄漏
-        if (mDlReceiverReg) {
-            try {
-                unregisterReceiver(mDlReceiver);
-            } catch (Exception ignored) {
-            }
-            mDlReceiverReg = false;
-        }
-        super.onDestroy();
-    }
-
     /** 读 assets 下的文本文件；读不到就返回一句说明，不崩。 */
     private String readAssetText(String name) {
         try {
@@ -2761,7 +2758,10 @@ public class MainActivity extends Activity {
      * （比如刚补的 r3 监听，就容易只在其中一处加上）。
      */
     private static class LicensePager {
-        View root;
+        // 类型要写成 LinearLayout 而不是 View：
+        // 「关于」对话框后面要往它上面 addView 一排外链按钮，
+        // 声明成 View 的话编译器找不到 addView 这个方法
+        android.widget.LinearLayout root;
         android.widget.TextView tv;
         android.widget.ScrollView sv;
         android.widget.RadioButton r1;
