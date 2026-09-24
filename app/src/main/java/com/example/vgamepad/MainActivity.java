@@ -1586,6 +1586,14 @@ public class MainActivity extends Activity {
           日志是"这次改了什么"的说明。两个都弹的话，先看协议。
         */
         showChangelogIfUpdated();
+        /*
+          静默检查放最后：它是后台线程，不挡界面，
+          但要等协议弹完 —— 没同意协议就不该联网。
+          内部有 mAutoChecked 兜着，一次生命周期只查一次。
+        */
+        if (hasAgreed()) {
+            silentCheckUpdate();
+        }
     }
 
     /** 显示当前实际生效的穿透模式，用来判断反射成没成功。 */
@@ -2023,10 +2031,34 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        // 标题吃掉剩下的宽度，把关于挤到最右边
+
+        /*
+          「正在检查更新…」这一行放在标题右边、⋯ 左边。
+
+          【为什么放在 row 内部】
+            row 是替换标题后新增的容器，box 的子控件总数不变，
+            所以已存档的隐藏设置索引一个都不动（见上面的说明）。
+            在 row 里加控件不会影响任何位置索引。
+
+          【为什么默认 GONE】
+            不检查的时候它不占地方，标题和 ⋯ 的位置跟以前一样。
+        */
+        TextView status = new TextView(this);
+        status.setTextSize(11f);
+        status.setTextColor(0xFF888888);
+        status.setSingleLine(true);
+        status.setVisibility(View.GONE);
+        int ps = (int) (6 * d);
+        status.setPadding(ps, 0, ps, 0);
+        mUpdateStatus = status;
+
+        // 标题吃掉剩下的宽度，把状态和 ⋯ 挤到最右边
         LinearLayout.LayoutParams lpT = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         row.addView(title, lpT);
+        row.addView(status, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
         row.addView(about, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -2250,6 +2282,7 @@ public class MainActivity extends Activity {
     private void showTopMenu(View anchor) {
         android.widget.PopupMenu pm =
                 new android.widget.PopupMenu(this, anchor);
+        pm.getMenu().add("设置");
         pm.getMenu().add("检查更新");
         pm.getMenu().add("关于 / 开源许可");
         pm.getMenu().add("历史更新");
@@ -2263,6 +2296,8 @@ public class MainActivity extends Activity {
                             showLogDialog(true, null);
                         } else if (t.equals("检查更新")) {
                             checkUpdate();
+                        } else if (t.equals("设置")) {
+                            showSettingsDialog();
                         } else {
                             showAboutDialog();
                         }
@@ -2270,6 +2305,83 @@ public class MainActivity extends Activity {
                     }
                 });
         pm.show();
+    }
+
+    /* ================= 自动检查更新 ================= */
+
+    private static final String PREF_SET = "settings";
+    private static final String PREF_AUTO_UPDATE = "auto_check_update";
+    /** 默认开：协议里默认勾选的也是开，两边要一致。 */
+    private static final boolean AUTO_UPDATE_DEFAULT = true;
+
+    /** 标题右边那行"正在检查更新…"。检查完就置空。 */
+    private TextView mUpdateStatus = null;
+    /** 一次生命周期内只自动查一次（onResume 会多次触发）。 */
+    private boolean mAutoChecked = false;
+
+    private boolean autoUpdateEnabled() {
+        return getSharedPreferences(PREF_SET, MODE_PRIVATE)
+                .getBoolean(PREF_AUTO_UPDATE, AUTO_UPDATE_DEFAULT);
+    }
+
+    private void setAutoUpdate(boolean on) {
+        getSharedPreferences(PREF_SET, MODE_PRIVATE).edit()
+                .putBoolean(PREF_AUTO_UPDATE, on).apply();
+    }
+
+    /*
+      ---- 静默检查 ----
+
+      【"静默"指的是什么】
+        不弹加载框、不挡住界面、不打断任何操作。
+        只在标题右边显示一行小字"正在检查更新…"，查完就没了。
+        查不到更新也什么都不弹 —— 只有真的有新版才弹窗。
+
+      【为什么不用 ProgressDialog】
+        ProgressDialog 会盖住整个界面并抢焦点，用户一进软件就被卡住，
+        那就不是静默了。这里改成标题旁的一行状态文字，
+        界面照常可点，检查在后台线程跑。
+    */
+    private void silentCheckUpdate() {
+        if (mAutoChecked) {
+            return;
+        }
+        mAutoChecked = true;
+        if (!autoUpdateEnabled()) {
+            return;                      // 关了就不查，也不显示状态
+        }
+        setStatusText("正在检查更新…");
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final UpdateInfo info = fetchUpdate();
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        setStatusText("");
+                        // 静默模式：没更新 / 查不到都静默，不打扰
+                        if (info == null) {
+                            return;
+                        }
+                        if (info.code <= currentVersionCode()) {
+                            return;
+                        }
+                        showUpdateDialog(info);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 改标题右边那行状态字。传空串就隐藏。 */
+    private void setStatusText(String txt) {
+        if (mUpdateStatus == null) {
+            return;
+        }
+        mUpdateStatus.setText(txt);
+        mUpdateStatus.setVisibility(
+                (txt == null || txt.length() == 0) ? View.GONE : View.VISIBLE);
     }
 
     /* ================= 外链 ================= */
@@ -2924,7 +3036,12 @@ public class MainActivity extends Activity {
     */
     private static final String PREF_AGREE = "agreement";
     private static final String PREF_AGREE_KEY = "ver";
-    private static final int AGREE_VERSION = 1;
+    /*
+      v2：新增「自动检查更新」这一项（默认开），
+      涉及联网行为的变化，老用户必须重新确认一遍 ——
+      所以这里 +1，装了新版的老用户会再弹一次协议。
+    */
+    private static final int AGREE_VERSION = 2;
 
     private boolean hasAgreed() {
         return getSharedPreferences(PREF_AGREE, MODE_PRIVATE)
@@ -2978,6 +3095,42 @@ public class MainActivity extends Activity {
                     }
                 });
 
+        /*
+          「自动检查更新」放在正文上方 —— 一打开就看见，最醒目。
+
+          【为什么默认勾上】
+            这是联网相关选项，默认开等于默认会联网，
+            所以必须让用户一眼看到、并且能一秒取消。
+            藏起来的默认值 = 偷偷联网，那不如不做。
+        */
+        final android.widget.CheckBox cbAuto = new android.widget.CheckBox(this);
+        cbAuto.setText("自动检查更新（进入软件时静默检查）");
+        cbAuto.setChecked(AUTO_UPDATE_DEFAULT);
+        cbAuto.setTextSize(14f);
+        cbAuto.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        // 淡蓝底 + 内边距，让它从周围的白底里跳出来
+        cbAuto.setBackgroundColor(0xFFE8F0FE);
+        float dAuto = getResources().getDisplayMetrics().density;
+        int padA = (int) (10 * dAuto);
+        cbAuto.setPadding(padA, padA, padA, padA);
+
+        android.widget.TextView cbTip = new android.widget.TextView(this);
+        cbTip.setText("勾选后，每次进入软件会在后台比对一次版本，"
+                + "标题旁显示「正在检查更新…」，有新版才弹窗。"
+                + "也可在「⋯ → 设置」里随时关闭。");
+        cbTip.setTextSize(11f);
+        cbTip.setTextColor(0xFF666666);
+        cbTip.setPadding(padA, 0, padA, padA);
+
+        android.widget.LinearLayout autoBox = new android.widget.LinearLayout(this);
+        autoBox.setOrientation(android.widget.LinearLayout.VERTICAL);
+        autoBox.setBackgroundColor(0xFFE8F0FE);
+        autoBox.addView(cbAuto);
+        autoBox.addView(cbTip);
+
+        // 插到最顶部（下标 0），在页签和正文之前
+        pager.root.addView(autoBox, 0);
+
         mAgreeBtn = null;
         final android.app.AlertDialog dlg =
                 new android.app.AlertDialog.Builder(this)
@@ -2990,6 +3143,11 @@ public class MainActivity extends Activity {
                                     public void onClick(
                                             android.content.DialogInterface d, int w) {
                                         setAgreed();
+                                        // 同意时才落盘，中途退出不写
+                                        setAutoUpdate(cbAuto.isChecked());
+                                        // 第一次打开：同意完立刻查一次，
+                                        // 否则要下次进软件才查（onResume 里那次已经过了）
+                                        silentCheckUpdate();
                                     }
                                 })
                         .setNegativeButton("拒绝并退出",
@@ -3012,6 +3170,44 @@ public class MainActivity extends Activity {
         mAgreeBtn = dlg.getButton(
                 android.content.DialogInterface.BUTTON_POSITIVE);
         updateAgreeButton(seen);
+    }
+
+    /** 设置：目前就一个自动检查更新的开关。 */
+    private void showSettingsDialog() {
+        android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (14 * d);
+        box.setPadding(pad, pad, pad, pad);
+
+        final android.widget.CheckBox cb = new android.widget.CheckBox(this);
+        cb.setText("进入本软件，自动进行静默更新检查");
+        cb.setChecked(autoUpdateEnabled());
+        cb.setTextSize(14f);
+        box.addView(cb);
+
+        android.widget.TextView tip = new android.widget.TextView(this);
+        tip.setText("开启后，每次进入软件会在后台比对一次版本，"
+                + "标题右侧显示「正在检查更新…」，不影响任何操作。"
+                + "\n只有检测到新版本时才会弹窗；查不到或已是最新则静默。");
+        tip.setTextSize(11f);
+        tip.setTextColor(0xFF666666);
+        box.addView(tip);
+
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("设置")
+                .setView(box)
+                .setPositiveButton("保存",
+                        new android.content.DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(android.content.DialogInterface dlg, int w) {
+                                setAutoUpdate(cb.isChecked());
+                                toast(cb.isChecked() ? "已开启自动检查更新"
+                                        : "已关闭自动检查更新");
+                            }
+                        })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     /** 三项都看过才放开「同意」；没看完时给出还剩几项。 */
