@@ -1,1 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="18dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="虚拟手柄"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <!-- 状态卡片 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:background="#18000000"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/tv_step"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="正在检测…"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_advice"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text=""
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tv_checks"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text=""
+                android:textSize="12sp"
+                android:typeface="monospace" />
+        </LinearLayout>
+
+        <!-- APK 构建时间：用来确认"装上的到底是不是刚编的那个" -->
+        <TextView
+            android:id="@+id/tv_apk"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="#18000000"
+            android:padding="10dp"
+            android:text=""
+            android:textSize="11sp"
+            android:typeface="monospace" />
+
+        <!-- 命令区 -->
+        <TextView
+            android:id="@+id/tv_cmd_label"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="守护进程启动命令"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/cmd_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="#22000000"
+            android:padding="10dp"
+            android:textIsSelectable="true"
+            android:textSize="11sp"
+            android:typeface="monospace" />
+
+        <Button
+            android:id="@+id/btn_copy"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="复制命令" />
+
+        <Button
+            android:id="@+id/btn_auto"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="自动激活（用 Shizuku 启动守护进程）" />
+
+        <Button
+            android:id="@+id/btn_shizuku"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="打开 Shizuku（验证是否真的没装）" />
+
+        <Button
+            android:id="@+id/btn_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="悬浮窗权限" />
+
+        <Button
+            android:id="@+id/btn_edit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="编辑按键布局" />
+
+        <Button
+            android:id="@+id/btn_start"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="启动悬浮手柄" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="说明：本 app 无法自行以 shell 身份执行命令（那需要 Shizuku SDK，当前编译环境不支持）。所以最后一步仍需粘贴到 Shizuku / Termux / LADB / 电脑 adb 中执行。执行后它会自动挂起不返回，回到本页会自动重新检测。"
+            android:textSize="11sp" />
+
+    </LinearLayout>
+
+</ScrollView>
