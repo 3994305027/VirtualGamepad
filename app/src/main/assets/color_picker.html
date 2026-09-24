@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  调色盘页面：给"按键底色"挑颜色 + 调透明度。
+
+  为什么要有这个页面：
+    Android 公开的 Intent 里没有"取色"这一类（只有取图片 / 取联系人），
+    android.graphics.Color 也只有解析方法、没有取色界面。
+    但 HTML 有 <input type="color"> —— 由 WebView 提供原生取色器，
+    所以这里借它一用，选完通过 JS 接口把值回传给 Java。
+
+  file:// 页面下 JS 接口照样可用（addJavascriptInterface 不挑协议），
+  也不需要网络权限。背景那张"游戏画面"是内联 SVG，同样不走网络。
+-->
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>挑个颜色</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #212121; color: #EEEEEE;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh;
+  }
+  h2 { font-size: 17px; font-weight: 500; margin: 8px 0 18px; }
+  /* 原生取色器本体：给它一个够大的点击区，手指好按 */
+  #pick {
+    width: 160px; height: 80px; padding: 0;
+    border: 2px solid #555; border-radius: 10px; background: #333;
+    cursor: pointer;
+  }
+  /*
+    提示放在色块**上方**，箭头朝下 ↓ 指向色块。
+
+    【为什么不放右边用 ←】
+      横排时文字紧贴色块，"点此按钮选择 ←" 里的"此按钮"很容易被读成
+      指这句提示本身（好像点文字也能触发），而不是指左边的色块。
+      现在提示在上、箭头朝下，指谁一目了然。
+  */
+  .pickrow {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  .hint {
+    font-size: 13px; color: #9E9E9E; line-height: 1.4; text-align: center;
+  }
+  .row { margin-top: 16px; display: flex; align-items: center; gap: 10px; }
+  /*
+    hex 是**可编辑**的输入框，不是只读文本。
+    点一下就能直接改（比如把 C0 打成 80），改完色块和滑条跟着走。
+    用输入框而不是 div + contenteditable：光标 / 全选 / 软键盘都正常。
+  */
+  #hex {
+    font-family: monospace; font-size: 18px; letter-spacing: 1px;
+    background: #2E2E2E; border: 1px solid #555; border-radius: 6px;
+    padding: 8px 12px; width: 132px; text-align: center;
+    color: #EEE; text-transform: uppercase;
+  }
+  #hex:focus { border-color: #1E88E5; outline: none; }
+  #hex.bad { border-color: #E53935; color: #EF9A9A; }
+  #preview {
+    width: 42px; height: 42px; border-radius: 8px;
+    border: 1px solid #666; background: #FFFFFF;
+  }
+
+  /* ---- 透明度 ---- */
+  .sec {
+    margin-top: 22px; width: 100%; max-width: 300px;
+    border-top: 1px solid #3A3A3A; padding-top: 16px;
+  }
+  .sechead {
+    display: flex; align-items: baseline; justify-content: space-between;
+    font-size: 14px;
+  }
+  #apct { font-family: monospace; font-size: 16px; color: #FFB74D; }
+  /*
+    预览台：后面铺一张"游戏画面"，上面盖一个**正方形色块**。
+
+    【为什么色块不铺满】
+      铺满就无从对比 —— 不知道透出来多少、也不知道盖住了多少。
+      留出一圈没被盖到的画面，眼睛直接就能看出"现在透到什么程度"。
+  */
+  #stage {
+    position: relative; margin: 12px auto 0;
+    width: 100%; height: 150px; border-radius: 8px; overflow: hidden;
+    background-repeat: no-repeat; background-size: cover;
+    background-position: center;
+    border: 1px solid #555;
+  }
+  #swatch {
+    position: absolute; left: 50%; top: 50%;
+    width: 46%; height: 78%;
+    transform: translate(-50%, -50%);
+    border: 1px solid rgba(255,255,255,0.55);
+    border-radius: 4px;
+  }
+  #alpha {
+    width: 100%; margin: 14px 0 0;
+  }
+  /*
+    单位切换：百分比（默认）/ 十进制。
+    有人习惯看 75%，有人要精确对齐某个 0xC0 —— 两种都给。
+    选完记进 localStorage，下次打开还是这个制。
+  */
+  .units { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+  .unitbtn {
+    padding: 5px 12px; font-size: 12px; border-radius: 14px; cursor: pointer;
+    border: 1px solid #555; background: #2E2E2E; color: #BBB;
+  }
+  .unitbtn.on { background: #1E88E5; border-color: #1E88E5; color: #FFF; }
+  .warn {
+    margin-top: 6px; font-size: 12px; color: #EF9A9A; text-align: center;
+    min-height: 16px;
+  }
+  #ok {
+    margin-top: 22px; width: 100%; max-width: 260px;
+    padding: 13px 0; font-size: 16px; color: #FFF;
+    background: #1E88E5; border: 0; border-radius: 8px; cursor: pointer;
+  }
+  #ok:active { background: #1565C0; }
+  .tip { margin-top: 14px; font-size: 12px; color: #999; text-align: center; }
+</style>
+</head>
+<body>
+  <h2>挑个颜色</h2>
+  <div class="pickrow">
+    <div class="hint">点下面这个色块选颜色 &darr;</div>
+    <input type="color" id="pick" value="#FFFFFF">
+  </div>
+  <div class="row">
+    <div id="preview"></div>
+    <input type="text" id="hex" value="#FFFFFFFF"
+           spellcheck="false" autocomplete="off" autocapitalize="characters">
+  </div>
+  <div class="hint">点上面的色值可以直接改（#AARRGGBB）</div>
+
+  <div class="sec">
+    <div class="sechead">
+      <span>透明度</span>
+      <span id="apct">100%</span>
+    </div>
+    <div id="stage">
+      <div id="swatch"></div>
+    </div>
+    <input type="range" id="alpha" min="0" max="100" step="1" value="100">
+    <div class="units">
+      <span class="unitbtn on" id="upct">百分比</span>
+      <span class="unitbtn" id="u255">十进制</span>
+    </div>
+    <div class="warn" id="warn"></div>
+    <div class="hint">色块只盖住中间一块，两边露出来的画面可以直接对比</div>
+  </div>
+
+  <button id="ok">用这个颜色</button>
+  <!--
+    这句写"会应用到几个键"，而不是重复说明"点色块能取色" ——
+    后者就是页面上那个控件本身，再说一遍等于废话。
+    数量由 Java 通过 URL 的 n= 参数带进来。
+  -->
+  <div class="tip" id="tip"></div>
+
+<script>
+  var pick = document.getElementById('pick');
+  var hex = document.getElementById('hex');
+  var preview = document.getElementById('preview');
+  var alpha = document.getElementById('alpha');
+  var apct = document.getElementById('apct');
+  var swatch = document.getElementById('swatch');
+  var warn = document.getElementById('warn');
+
+  /*
+    预览台的背景：内联 SVG 画的一小片"游戏画面"。
+
+    【为什么是内联的】
+      页面在 file:// 下跑，也没有网络权限 —— 外链图片取不到。
+      内联一段 SVG 就既有画面感（天空 / 太阳 / 远近山 / 房子），
+      又不需要任何额外文件；盖上半透明色块时透什么一目了然。
+  */
+  var SCENE = "data:image/svg+xml;utf8,"
+    + "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='180'>"
+    + "<defs><linearGradient id='s' x1='0' y1='0' x2='0' y2='1'>"
+    + "<stop offset='0' stop-color='%234FC3F7'/>"
+    + "<stop offset='1' stop-color='%23B3E5FC'/></linearGradient></defs>"
+    + "<rect width='320' height='180' fill='url(%23s)'/>"
+    + "<circle cx='264' cy='36' r='21' fill='%23FFD54F'/>"
+    + "<path d='M0 128 L66 82 L118 116 L168 68 L228 118 L282 90 L320 124 L320 180 L0 180 Z' fill='%2381C784'/>"
+    + "<path d='M0 148 L58 118 L128 150 L198 120 L268 148 L320 132 L320 180 L0 180 Z' fill='%234CAF50'/>"
+    + "<rect x='26' y='148' width='34' height='22' fill='%238D6E63'/>"
+    + "<polygon points='20,150 43,132 66,150' fill='%235D4037'/>"
+    + "<rect x='236' y='142' width='42' height='28' fill='%23A1887F'/>"
+    + "<polygon points='230,144 257,124 284,144' fill='%236D4C41'/>"
+    + "<rect x='140' y='156' width='10' height='16' fill='%23795548'/>"
+    + "<circle cx='145' cy='150' r='11' fill='%2338A169'/>"
+    + "</svg>";
+  document.getElementById('stage').style.backgroundImage = "url(\"" + SCENE + "\")";
+
+  // 初值、透明度和目标数量由 Java 通过 URL 查询参数带进来
+  // （?c=RRGGBB&a=AA&n=3）
+  function fromQuery() {
+    var m = /[?&]c=([0-9a-fA-F]{6})/.exec(location.search);
+    if (m) return '#' + m[1].toUpperCase();
+    return '#FFFFFF';
+  }
+
+  function alphaFromQuery() {
+    var m = /[?&]a=([0-9a-fA-F]{2})/.exec(location.search);
+    if (m) return parseInt(m[1], 16);
+    return 255;
+  }
+
+  function countFromQuery() {
+    var m = /[?&]n=(\d+)/.exec(location.search);
+    return m ? parseInt(m[1], 10) : 1;
+  }
+
+  function to2(v) {
+    var s = v.toString(16).toUpperCase();
+    return s.length < 2 ? '0' + s : s;
+  }
+
+  /*
+    单位：'pct' = 百分比（默认，0..100），'raw' = 十进制（0..255）。
+    内部变量名仍叫 pct / raw —— 只是按钮上显示成"百分比 / 十进制"。
+    存 localStorage，下次打开还是上回选的那个。
+
+    【file:// 下能不能存】
+      能，但要 WebView 开 setDomStorageEnabled —— 见 MainActivity。
+      取不到（隐私模式 / 老 WebView）就退回百分比，不影响使用。
+  */
+  var UKEY = 'vgp_color_alpha_unit';
+  function loadUnit() {
+    try {
+      var u = localStorage.getItem(UKEY);
+      return (u === 'raw') ? 'raw' : 'pct';
+    } catch (e) {
+      return 'pct';
+    }
+  }
+  function saveUnit(u) {
+    try {
+      localStorage.setItem(UKEY, u);
+    } catch (e) {
+    }
+  }
+  var unit = loadUnit();
+  var upct = document.getElementById('upct');
+  var u255 = document.getElementById('u255');
+
+  /** 当前滑条值 → 0..255 的 alpha。 */
+  function sliderToA255() {
+    var v = parseInt(alpha.value, 10);
+    if (isNaN(v)) v = unit === 'raw' ? 255 : 100;
+    return unit === 'raw' ? v : Math.round(v * 255 / 100);
+  }
+
+  /** 0..255 的 alpha → 当前单位下的滑条值。 */
+  function a255ToSlider(a) {
+    return unit === 'raw' ? a : Math.round(a * 100 / 255);
+  }
+
+  /**
+   * 切单位：换滑条量程，值必须跟着换算。
+   *
+   * 【oldUnit 不能省】
+   *   切换是"先改 unit 再调这个函数"，而 sliderToA255() 读的是
+   *   **当前的** unit —— 那时已经是新单位了。
+   *   结果是十进制下的 128 被当成"百分比的 128"反推成 326，
+   *   滑条量程换成 100 却写着 128，色值也溢出成 9 位。
+   *   所以旧单位必须由调用方传进来。
+   */
+  function applyUnit(oldUnit) {
+    var v = parseInt(alpha.value, 10);
+    if (isNaN(v)) v = oldUnit === 'raw' ? 255 : 100;
+    var a = oldUnit === 'raw' ? v : Math.round(v * 255 / 100);
+    alpha.max = (unit === 'raw') ? '255' : '100';
+    alpha.value = String(a255ToSlider(a));   // 再用新单位写回去
+    /*
+      【切单位算"动过"，以滑条为准】
+        不动这个的话：75% 反推是 191，而原始 alpha 是 192 ——
+        滑条停在 191、右上却显示 192、色值又是 C0，三处对不上。
+        切换单位是明确的操作，就让滑条说话，三处统一。
+        （"不碰就保持原样"保护的是只改颜色、根本没碰过透明度的场景。）
+    */
+    if (unit !== oldUnit) {
+      alphaTouched = true;
+      origAlpha = a;
+    }
+    upct.className = 'unitbtn' + (unit === 'pct' ? ' on' : '');
+    u255.className = 'unitbtn' + (unit === 'raw' ? ' on' : '');
+    saveUnit(unit);
+  }
+
+  /** 把当前颜色 + 透明度套到各处预览上。 */
+  function paint() {
+    // <input type="color"> 的 value 一定是 #rrggbb 小写，统一成大写好看
+    var s = (pick.value || '').toUpperCase();
+    if (!/^#[0-9A-F]{6}$/.test(s)) s = '#FFFFFF';
+
+    /*
+      【没碰过滑条 / 没手动改过 hex，就用原始 alpha，不来回换算】
+        滑条只有整数档，而 alpha 是 0~255 —— 75% 反推是 191（0xBF），
+        原来那个 0xC0 是 192。差 1 看不出来，
+        但"我只想换个色、透明度却悄悄动了一点"能免就免。
+    */
+    var a255 = alphaTouched ? sliderToA255() : origAlpha;
+
+    // 【正在编辑 hex 时不要覆盖它】
+    //   一边打字一边被程序改回去，光标乱跳、字也打不进去。
+    if (document.activeElement !== hex) {
+      hex.value = '#' + to2(a255) + s.substring(1);
+      hex.className = '';
+    }
+
+    var r = parseInt(s.substring(1, 3), 16);
+    var g = parseInt(s.substring(3, 5), 16);
+    var b = parseInt(s.substring(5, 7), 16);
+    var rgba = 'rgba(' + r + ',' + g + ',' + b + ',' + (a255 / 255) + ')';
+
+    // 小方块：直接铺色（它是"这个色本身"，不混背景，看的是色相）
+    preview.style.background = s;
+    // 舞台上的色块：带透明度，盖在游戏画面上，看的是实际观感
+    swatch.style.background = rgba;
+
+    var shown = Math.round(a255 * 100 / 255);
+    /*
+      【十进制下的显示值】
+
+      两位十六进制有 16×16 = 256 个取值，范围 0..255，满值 0xFF = 255。
+      滑条的值域仍是 0..255 的字节（改不了，一个字节就这么大），
+      但**显示**要按 256 换算：191 × 256 / 255 = 192，
+      正好等于默认色里那个 0xC0 —— 显示数和真实字节对得上。
+      100% 时 255 × 256 / 255 = 256 越界，压回 255。
+    */
+    // 显示跟着单位走：百分比看 75%，十进制看字节值本身（75% 就是 192 = 0xC0）
+    apct.textContent = (unit === 'raw') ? String(a255) : (shown + '%');
+    warn.textContent = (shown <= 10)
+        ? '太低了，装到画面上会几乎看不见' : '';
+  }
+
+  /*
+    hex 输入框：手动编辑。
+
+    认这几种：#AARRGGBB / #RRGGBB / #ARGB / #RGB，也认不带 # 的。
+    认出来就同步色块和滑条；认不出来就描红边，**不动别的** ——
+    宁可等你改完，也别乱猜一个值塞进去。
+  */
+  function parseHexInput(t) {
+    var s = (t || '').trim();
+    if (s.charAt(0) === '#') s = s.substring(1);
+    if (!/^[0-9a-fA-F]+$/.test(s)) return null;
+    if (s.length === 3) {                       // RGB
+      return { rgb: s.charAt(0) + s.charAt(0) + s.charAt(1) + s.charAt(1)
+                  + s.charAt(2) + s.charAt(2), a: null };
+    }
+    if (s.length === 4) {                       // ARGB
+      var a = s.charAt(0) + s.charAt(0);
+      return { rgb: s.substring(1, 4).replace(/./g, function (c) {
+        return c + c; }), a: parseInt(a, 16) };
+    }
+    if (s.length === 6) {
+      return { rgb: s, a: null };
+    }
+    if (s.length === 8) {
+      return { rgb: s.substring(2), a: parseInt(s.substring(0, 2), 16) };
+    }
+    return null;
+  }
+
+  var origAlpha = alphaFromQuery();
+  var alphaTouched = false;
+  pick.value = fromQuery().toLowerCase();
+  /*
+    【先定量程，再写值 —— 顺序反了值会被夹掉】
+
+    HTML 里 <input type="range"> 的 max 写死是 100。
+    而十进制下的值是 0..255（比如 75% 就是 192），
+    先写 191 的话浏览器会按当时的 max=100 把它**夹成 100**，
+    之后就算把 max 改成 255，值也已经变成 100 了 ——
+    于是"显示 191，滑条却停在 100（≈39%）"，两个对不上。
+
+    这个坑只在记住了十进制时才会出现：
+    百分比下初值 0..100 本来就装得下，夹了也看不出来。
+  */
+  alpha.max = (unit === 'raw') ? '255' : '100';
+  alpha.value = String(a255ToSlider(origAlpha));
+  applyUnit(unit);      // 初始调用：新旧单位相同，只定量程和按钮态
+  paint();
+
+  var cnt = countFromQuery();
+  document.getElementById('tip').textContent =
+      '确定后应用到 ' + cnt + ' 个按键';
+
+  pick.addEventListener('input', paint);
+
+  alpha.addEventListener('input', function () {
+    alphaTouched = true;      // 动过滑条才按滑条的值换算，否则保持原始 alpha
+    paint();
+  });
+
+  upct.addEventListener('click', function () {
+    if (unit === 'pct') return;
+    var old = unit;
+    unit = 'pct'; applyUnit(old); paint();
+  });
+  u255.addEventListener('click', function () {
+    if (unit === 'raw') return;
+    var old = unit;
+    unit = 'raw'; applyUnit(old); paint();
+  });
+
+  /*
+    【点输入框时主动叫输入法】
+
+    Dialog 里 WebView 的输入框常常只拿到焦点、却不弹键盘。
+    focus 时通知 Java 那边 showSoftInput，比等 IMM 自己判断稳。
+    （硬件键盘能输入就是这个现象的佐证：焦点在，只是 IME 没被叫起来。）
+  */
+  hex.addEventListener('focus', function () {
+    try { Android.showIme(); } catch (e) { }
+  });
+
+  hex.addEventListener('input', function () {
+    var p = parseHexInput(hex.value);
+    if (!p) {
+      hex.className = 'bad';       // 认不出来：描红，等用户改完
+      return;
+    }
+    hex.className = '';
+    pick.value = '#' + p.rgb.toLowerCase();
+    if (p.a !== null) {
+      origAlpha = p.a;             // 手动改了 alpha，就以这个为准
+      alphaTouched = true;
+      alpha.value = String(a255ToSlider(p.a));
+    }
+    paint();
+  });
+  hex.addEventListener('blur', function () {
+    hex.className = '';           // 失焦时按当前真实值重排一次，清掉残留
+    paint();
+  });
+
+  document.getElementById('ok').addEventListener('click', function () {
+    // Android 是 Java 那边 addJavascriptInterface 注入的对象名。
+    // 回传 8 位 #AARRGGBB —— 页面自己调过透明度，就用页面这个值。
+    //
+    // 【hex 现在是输入框，得用 value，而且可能正打到一半】
+    //   直接把半成品回传，Java 端 parseColorHex 认不出来就整个不动，
+    //   表现是"点了确定没反应" —— 很像是坏了。
+    //   所以这里先解析一次：认不出来就按当前色块 + 滑条重算一个合法的。
+    var v = String(hex.value || '').trim();
+    var p = parseHexInput(v);
+    if (!p) {
+      var a = alphaTouched ? sliderToA255() : origAlpha;
+      v = '#' + to2(a) + (pick.value || 'ffffff').substring(1).toUpperCase();
+    } else {
+      v = '#' + to2(p.a === null ? 255 : p.a) + p.rgb.toUpperCase();
+    }
+    if (window.Android) {
+      window.Android.onColor(v);
+    }
+  });
+</script>
+</body>
+</html>
