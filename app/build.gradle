@@ -19,8 +19,8 @@ android {
         // 版本号 = 更新时间，格式 年.月.日.时.分
         // versionCode 是 int，上限 2147483647，
         // 用「距 2026-01-01 的分钟数」，比直接拼 2609241317（已溢出）稳妥
-        versionCode 383837
-        versionName "26.9.24.13.17"
+        versionCode 384302
+        versionName "26.9.24.21.2"
     }
 
     compileOptions {
