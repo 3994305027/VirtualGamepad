@@ -1,0 +1,52 @@
+apply plugin: 'com.android.application'
+
+android {
+    // compileSdk 必须 33：Shizuku API 13.1.5 的 AAR 是按 33 编的，
+    // 用 30 编会出现 "requires compileSdkVersion 33" 之类的报错。
+    //
+    // 注意 compileSdk 和 targetSdk 是两回事：
+    //   compileSdk 33 = 用 33 的 API 编译（只为满足 AAR）
+    //   targetSdk  28 = 运行时按 28 的行为走（保持不变！）
+    // targetSdk 升到 30+ 会触发包可见性限制、后台启动前台服务受限等一堆问题，
+    // 本工程靠的正是前台服务 + 悬浮窗，所以这里**刻意**保持 28 不动。
+    compileSdkVersion 33
+    buildToolsVersion "33.0.1"
+
+    defaultConfig {
+        applicationId "com.example.vgamepad"
+        minSdkVersion 26
+        targetSdkVersion 28
+        // 版本号 = 更新时间，格式 年.月.日.时.分
+        // versionCode 是 int，上限 2147483647，
+        // 用「距 2026-01-01 的分钟数」，比直接拼 2609241317（已溢出）稳妥
+        versionCode 383837
+        versionName "26.9.24.13.17"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lintOptions {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // Shizuku API。版本按实测能拉到的来：12.2.0 在 google()+mavenCentral()
+    // 上取不到，13.1.5 可以。
+    //
+    // aidl 这一行别省：api 的 POM 里虽声明了对它的依赖，但 AIDE 这类环境
+    // 有时不解析传递依赖，显式写上才能编过。
+    //
+    // ⚠️ 13.1.5 里 Shizuku.newProcess(...) 是 **private static**
+    //    （官方想推 UserService，给它标了"准备移除"）。
+    //    所以 ShizukuRunner 里必须用 getDeclaredMethod + setAccessible(true)
+    //    反射调用 —— getMethod() 只找 public，永远找不到它。
+    def shizuku_version = "13.1.5"
+    implementation "dev.rikka.shizuku:api:$shizuku_version"
+    implementation "dev.rikka.shizuku:provider:$shizuku_version"
+    implementation "dev.rikka.shizuku:aidl:$shizuku_version"
+}
