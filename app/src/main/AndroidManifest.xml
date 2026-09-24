@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.vgamepad"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- 【targetSdkVersion 保持 28，别往上升】
+         升到 30+ 会主动打开 Android 11 的包可见性限制（现在 28 是"所有 app
+         自动可见"，升了反而查不到），而补救用的 <queries> 老 aapt 又编译不过。
+         升到 31+ 后台启动前台服务受限；升到 34+ FOREGROUND_SERVICE 必须声明
+         具体类型，否则 startForeground() 直接抛异常、悬浮球起不来。
+         详见使用说明.txt「把 targetSdkVersion 改高不就行了？」一节。 -->
+    <uses-sdk
+        android:minSdkVersion="26"
+        android:targetSdkVersion="28" />
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- 必须有：Android 上 app 创建 socket 需要 INTERNET 权限，
+         即使是连 127.0.0.1。没有它 connect() 会抛
+         SocketException: Permission denied (EACCES/EPERM)，
+         这正是之前"守护进程在跑但显示未连接"的根因。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!-- 【Android 8.0+ 安装 APK 必需】
+         没有它 startActivity(ACTION_VIEW) 装 APK 会被静默拒绝，
+         或者干脆崩。这不是运行时权限，弹不出授权框，
+         必须跳系统设置页让用户手动开关（见 canInstallFromUnknown()）。
+         minSdk 是 26，所以不用做版本判断。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 【这里踩过坑，别再加 <queries> 回去】
+         之前为了 Android 11+ 的包可见性加了：
+             <queries><package android:name="moe.shizuku.privileged.api"/></queries>
+         结果 <queries> 是 API 30 才引入的，老 aapt（AIDE 用的那版）不认识它，
+         资源编译直接失败 -> R.java 没重新生成 -> 新加的 btn_shizuku 找不到，
+         报 "Unknown member 'btn_shizuku' of 'R.id'"（旧 id 因为是旧的 R.java 反而正常）。
+
+         而且本工程 targetSdkVersion = 28，包可见性限制只对 targetSdk >= 30 生效，
+         本来就用不着它。真遇到"查不到 Shizuku"，靠「打开 Shizuku」按钮
+         直接 startActivity 绕过即可（那条路不受包可见性限制）。 -->
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!-- Shizuku SDK 的入口。没有它 Shizuku.pingBinder() 永远返回 false，
+             因为拿不到 Shizuku 服务回传的 Binder。
+               authorities 必须全局唯一，所以用 applicationId 前缀。
+               android:permission 那行是官方要求的写法，用来阻止普通 app
+               访问这个 provider（它是系统权限，第三方拿不到，所以等于只对
+               Shizuku 自己开放）。改动 applicationId 时这里要同步改。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.example.vgamepad.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- 不再锁死竖屏：跟着系统转，横屏竖屏都能用。
+             声明 configChanges 是为了转屏时不重建界面，输入的内容不会丢。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="fullSensor"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".FloatingService"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!-- 这里原来还声明过一个 com.example.vgamepad.ShizukuProvider（手写客户端用的），
+             authority 和上面官方的完全一样。两个 provider 不能共用 authority，
+             否则安装时直接 INSTALL_FAILED_CONFLICTING_PROVIDER。
+             改用官方 SDK 后只留上面那个。
+             如果哪天要切回零依赖的手写客户端（ShizukuClient.java 还留在工程里），
+             把上面 rikka.shizuku.ShizukuProvider 这段换回下面这段即可：
+                 <provider android:name=".ShizukuProvider"
+                     android:authorities="com.example.vgamepad.shizuku"
+                     android:multiprocess="false" android:enabled="true"
+                     android:exported="true"
+                     android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        -->
+
+    </application>
+
+</manifest>
