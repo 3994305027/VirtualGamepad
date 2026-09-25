@@ -2394,6 +2394,9 @@ public class MainActivity extends Activity {
             "https://1834362934.share.123pan.cn/123pan/6OZQTd-K23hH";
     /** 作者 B 站主页。 */
     private static final String URL_BILIBILI = "https://b23.tv/r6uKjwj";
+    /** Release 页面（给人看的仓库发布页，不是 APK 直链）。 */
+    private static final String URL_RELEASES =
+            "https://github.com/3994305027/VirtualGamepad/releases/latest";
 
     /** 用浏览器打开一个地址。打不开（没装浏览器等）就提示一句，不崩。 */
     private void openUrl(String url) {
@@ -2436,6 +2439,7 @@ public class MainActivity extends Activity {
         int code;
         String name = "";
         String apkUrl = "";        // GitHub 上的 APK 直链
+        String htmlUrl = "";       // Release 页面地址（给人看的网页）
         String netdiskUrl = "";    // 网盘地址（可选，给用户多一条路）
         String changelog = "";
         String from = "";          // 走通的是哪个源，出问题时好排查
@@ -2517,16 +2521,19 @@ public class MainActivity extends Activity {
     /** Release API 优先，失败再依次试 version.json。全失败返回 null。 */
     private UpdateInfo fetchUpdate() {
         UpdateInfo info = fetchLatestRelease();
-        if (info != null) {
-            return info;
-        }
-        for (String base : UPDATE_URLS) {
-            info = fetchOne(base + "?t=" + System.currentTimeMillis());
-            if (info != null) {
-                return info;
+        if (info == null) {
+            for (String base : UPDATE_URLS) {
+                info = fetchOne(base + "?t=" + System.currentTimeMillis());
+                if (info != null) {
+                    break;
+                }
             }
         }
-        return null;
+        if (info != null && info.htmlUrl.length() == 0) {
+            // version.json 里没有页面地址，用固定的 Release 页兜底
+            info.htmlUrl = URL_RELEASES;
+        }
+        return info;
     }
 
     /**
@@ -2591,6 +2598,8 @@ public class MainActivity extends Activity {
             info.changelog = note.trim();
             info.code = intFromNote(note, "versionCode");
             info.netdiskUrl = strFromNote(note, "网盘");
+            // API 给的 html_url 就是 Release 页面；万一没有就退回固定地址
+            info.htmlUrl = o.optString("html_url", "");
             info.from = "api.github.com";
 
             if (info.code <= 0) {
@@ -2727,34 +2736,161 @@ public class MainActivity extends Activity {
         sb.append("来源：").append(hostOf(info.from));
 
         /*
-          两个下载入口，一定都有：
-            GitHub Release  -> DownloadManager 直接下 APK 并叫起安装器
-            网盘            -> 跳转浏览器
+          三个下载入口，一定都有：
+            网盘          -> 跳转浏览器
+            GitHub 仓库   -> 跳转浏览器，打开 Release 页面（可以自己挑文件）
+            GitHub 直链   -> DownloadManager 直接下 APK 并叫起安装器
+
           Release 说明里另写了「网盘: ...」就用写的那个，
           没写就用内置的默认网盘地址 —— 保证网盘入口始终存在。
         */
         final String netdisk = (info.netdiskUrl.length() > 0)
                 ? info.netdiskUrl : URL_NETDISK;
+        final String repo = (info.htmlUrl.length() > 0)
+                ? info.htmlUrl : URL_RELEASES;
 
-        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+        /*
+          【为什么不用对话框自带的三个按钮位】
+            AlertDialog 只有 Positive / Negative / Neutral 三个位置，
+            三个下载入口加「以后再说」是四个，放不下。
+
+            而且自带的按钮位是 Negative 在左、Positive 在右，
+            三个下载入口里会有两个被挤到中间和左边 ——
+            网盘就跑到左边去了。
+
+            所以改成：正文和下载按钮都放进自定义 view。
+
+          【下载和「以后再说」排同一行】
+            原来下载单独一行、「以后再说」是系统按钮在下面又占一行，
+            那行右边是空的，白白浪费。
+            现在：三个下载靠左，中间 spacer 撑开，「以后再说」顶到最右。
+            省下的一行还给正文（上限 42% -> 50%）。
+            跟「关于」页底部「外链 + 关闭」同一行的做法保持一致。
+
+            因为要同一行，「以后再说」不再用 setNegativeButton，
+            改成自己画、拿到 dialog 后自己 dismiss。
+        */
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (16 * d);
+
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.setPadding(pad, (int) (6 * d), pad, pad);
+
+        /*
+          正文：更新说明可能很长，要能滚动，且不能把下面的按钮挤没。
+          上限跟「关于」页一样是 50%（下载按钮和「以后再说」合并成一行后，
+          省下的一行还给正文）。
+        */
+        final int maxH = (int) (getResources().getDisplayMetrics().heightPixels * 0.50);
+        android.widget.ScrollView sv = new android.widget.ScrollView(this) {
+            @Override
+            protected void onMeasure(int wms, int hms) {
+                // 高度最多 maxH，内容少就收缩 —— 短说明不会留一大片空白
+                super.onMeasure(wms,
+                        android.view.View.MeasureSpec.makeMeasureSpec(
+                                maxH, android.view.View.MeasureSpec.AT_MOST));
+            }
+        };
+        android.widget.TextView tv = new android.widget.TextView(this);
+        tv.setText(sb.toString());
+        tv.setTextSize(13f);
+        tv.setTextColor(0xFF333333);
+        sv.addView(tv);
+        root.addView(sv, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        // 按钮行：三个下载靠左，spacer 撑开，「以后再说」顶到最右
+        android.widget.LinearLayout btns = new android.widget.LinearLayout(this);
+        btns.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        btns.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        btns.setPadding(0, (int) (10 * d), 0, 0);
+
+        addDlButton(btns, "123网盘", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUrl(netdisk);
+            }
+        });
+        addDlButton(btns, "GitHub 仓库", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUrl(repo);
+            }
+        });
+        addDlButton(btns, "GitHub 直链", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startDownload(info.apkUrl, info.name);
+            }
+        });
+
+        // 撑开中间的空档，把「以后再说」顶到最右
+        android.view.View spacer = new android.view.View(this);
+        btns.addView(spacer,
+                new android.widget.LinearLayout.LayoutParams(0, 0, 1f));
+
+        final android.widget.Button later = new android.widget.Button(this);
+        later.setText("以后再说");
+        later.setTextSize(11f);
+        later.setAllCaps(false);
+        later.setBackgroundColor(0x00000000);   // 透明底，跟下载按钮观感一致
+        later.setTextColor(0xFF555555);          // 中性灰，和蓝色的下载按钮区分开
+        later.setMinWidth(0);
+        later.setMinimumWidth(0);
+        later.setSingleLine(false);
+        later.setMaxLines(2);
+        later.setEllipsize(null);
+        int lh = (int) (5 * d);
+        int lhp = (int) (4 * d);
+        later.setPadding(lhp, lh, lhp, lh);
+        btns.addView(later);
+
+        root.addView(btns, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
                 .setTitle("发现新版本")
-                .setMessage(sb.toString())
-                .setPositiveButton("GitHub 下载",
-                        new android.content.DialogInterface.OnClickListener() {
-                            @Override
-                            public void onClick(android.content.DialogInterface d, int w) {
-                                startDownload(info.apkUrl, info.name);
-                            }
-                        })
-                .setNeutralButton("网盘下载",
-                        new android.content.DialogInterface.OnClickListener() {
-                            @Override
-                            public void onClick(android.content.DialogInterface d, int w) {
-                                openUrl(netdisk);
-                            }
-                        })
-                .setNegativeButton("以后再说", null);
-        b.show();
+                .setView(root)
+                .show();
+        later.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                dlg.dismiss();
+            }
+        });
+    }
+
+    /** 更新弹窗底部的下载按钮：无边框、蓝字，跟对话框自带按钮观感接近。 */
+    private void addDlButton(android.widget.LinearLayout parent,
+                             String text, View.OnClickListener l) {
+        android.widget.Button b = new android.widget.Button(this);
+        b.setText(text);
+        /*
+          字号 12sp -> 11sp、内边距 6dp -> 4dp：
+          更新弹窗一行要放四个按钮（三个下载 + 以后再说），
+          320dp 小屏按 12sp/6dp 粗估约 280dp，超过可用宽度会触发折行。
+          压到 11sp/4dp 后约 244dp，能放进一行。
+        */
+        b.setTextSize(11f);
+        b.setAllCaps(false);
+        b.setBackgroundColor(0x00000000);
+        b.setTextColor(0xFF1A73E8);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        float d = getResources().getDisplayMetrics().density;
+        int h = (int) (5 * d);
+        int hp = (int) (4 * d);
+        b.setPadding(hp, h, hp, h);
+        b.setSingleLine(false);
+        b.setMaxLines(2);
+        b.setEllipsize(null);
+        b.setOnClickListener(l);
+        parent.addView(b, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
     }
 
     /** 只取域名部分，给用户看是哪个源通的，不暴露完整 URL。 */
@@ -2902,7 +3038,27 @@ public class MainActivity extends Activity {
         p.tv.setTypeface(android.graphics.Typeface.MONOSPACE);
         p.tv.setPadding((int) (12 * d), (int) (10 * d), (int) (12 * d), (int) (10 * d));
 
-        p.sv = new android.widget.ScrollView(this);
+        /*
+          【为什么要限制这个 ScrollView 的高度】
+
+            Apache-2.0 全文有几千行，ScrollView 默认会按内容撑到很高，
+            结果把后面 addView 进去的外链按钮（关于页底部的 仓库/网盘/B站）
+            整个挤出屏幕 —— 按钮确实在，但永远看不到、点不着。
+
+            改成最多占屏幕高度 50%（外链和「关闭」合并成一行后多出来的
+            空间还给正文），剩下的留给下面的按钮。
+            内容少时按 AT_MOST 自动收缩，不会留一大片空白。
+        */
+        final int svMaxH =
+                (int) (getResources().getDisplayMetrics().heightPixels * 0.50);
+        p.sv = new android.widget.ScrollView(this) {
+            @Override
+            protected void onMeasure(int wms, int hms) {
+                super.onMeasure(wms,
+                        android.view.View.MeasureSpec.makeMeasureSpec(
+                                svMaxH, android.view.View.MeasureSpec.AT_MOST));
+            }
+        };
         p.sv.addView(p.tv);
         p.tv.setText(notice);
         applyAboutLinks(p.tv);
@@ -3246,25 +3402,63 @@ public class MainActivity extends Activity {
             ListView 要 new Adapter，还要处理点击；
             三个固定入口用横排按钮最直接，也不用改 XML。
         */
-        android.widget.LinearLayout links =
+        /*
+          【外链和「关闭」排在同一行】
+
+            原来外链单独占一行，「关闭」是对话框自带按钮、在下面又占一行，
+            而自带按钮那行的左边是空的，白白浪费。
+
+            改成：正文下面只排一行 —— 三个外链靠左，
+            中间用 spacer 撑开，把「关闭」顶到最右。
+            省下来的那行高度还给正文（上限 42% -> 50%）。
+
+          【为什么不用 setPositiveButton 了】
+            用它的话「关闭」会画在 setView 下方另起一行，做不到同一行。
+            所以自己画这个按钮，show() 拿到 dialog 后自己 dismiss。
+        */
+        android.widget.LinearLayout bar =
                 new android.widget.LinearLayout(this);
-        links.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        bar.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
         float d = getResources().getDisplayMetrics().density;
-        int lp = (int) (8 * d);
-        links.setPadding(lp, lp, lp, 0);
+        int lp = (int) (6 * d);
+        bar.setPadding(lp, lp, lp, 0);
 
-        addLinkButton(links, "仓库", URL_REPO);
-        addLinkButton(links, "网盘", URL_NETDISK);
-        addLinkButton(links, "B站", URL_BILIBILI);
+        addLinkButton(bar, "GitHub 仓库", URL_REPO);
+        addLinkButton(bar, "123网盘", URL_NETDISK);
+        addLinkButton(bar, "作者B站", URL_BILIBILI);
 
-        // 外链排在正文下面
-        pager.root.addView(links);
+        // 撑开中间的空档，把「关闭」顶到最右
+        android.view.View spacer = new android.view.View(this);
+        bar.addView(spacer,
+                new android.widget.LinearLayout.LayoutParams(0, 0, 1f));
 
-        new android.app.AlertDialog.Builder(this)
+        final android.widget.Button close = new android.widget.Button(this);
+        close.setText("关闭");
+        close.setTextSize(12f);
+        close.setAllCaps(false);
+        close.setBackgroundColor(0x00000000);   // 透明底，跟外链观感一致
+        close.setTextColor(0xFF555555);          // 中性灰，和外链的蓝色区分开
+        close.setMinWidth(0);
+        close.setMinimumWidth(0);
+        close.setSingleLine(false);
+        close.setMaxLines(2);
+        close.setEllipsize(null);
+        close.setPadding(lp, (int) (6 * d), lp, (int) (6 * d));
+        bar.addView(close);
+
+        pager.root.addView(bar);
+
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
                 .setTitle("关于" + ver)
                 .setView(pager.root)
-                .setPositiveButton("关闭", null)
                 .show();
+        close.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                dlg.dismiss();
+            }
+        });
     }
 
     /** 往 links 里加一个等宽的链接按钮。weight=1 让三个平分一行。 */
@@ -3276,9 +3470,22 @@ public class MainActivity extends Activity {
         b.setAllCaps(false);
         b.setBackgroundColor(0x00000000);       // 透明底，不破坏对话框观感
         b.setTextColor(0xFF1A73E8);
+        b.setSingleLine(false);
+        b.setMaxLines(2);
+        b.setEllipsize(null);
+        /*
+          不再 weight=1 平分：现在和「关闭」同一行，宽度按内容来，
+          剩下的空间全给中间的 spacer。
+
+          另外必须 setMinWidth(0)：Button 默认有最小宽度，
+          四个按钮各 64dp 就会挤爆一行，从而触发折行、反而变两行。
+        */
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
         android.widget.LinearLayout.LayoutParams pm =
                 new android.widget.LinearLayout.LayoutParams(
-                        0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
         b.setLayoutParams(pm);
         b.setOnClickListener(new View.OnClickListener() {
             @Override
