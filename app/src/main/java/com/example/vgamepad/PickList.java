@@ -138,6 +138,7 @@ abstract class PickList extends View {
     PadLayout mSyncSrc = null;
     int mSyncLayoutId = PadLayout.LAYOUT_DEFAULT_PAD;
     int mAppearSlot = NONE;
+    /** 进「优先级」子列表时选中的槽位：拖条可能切走 mSel，不先存就改错对象。 */
     int mStickX = 0;
     int mStickY = 0;
     int mTrigPct = 100;
@@ -147,6 +148,13 @@ abstract class PickList extends View {
     int mComboDirProto = NONE;
     boolean mShapeMode;
     boolean mStickCfg;
+    /**
+     * 是否停在"优先级"子模式（面板上只剩一条优先级滑条）。
+     *
+     * 和形状 / 摇杆设置同一套子模式机制：点「更多选项 → 优先级」进来，
+     * 面板原地换成优先级那条，左上角给「返回」回常规面板。
+     */
+    boolean mPrioMode;
     final RectF mShapeBtnRect = new RectF();
     final RectF mSubBackRect = new RectF();
     final RectF mShapeCircleRect = new RectF();
@@ -379,6 +387,7 @@ abstract class PickList extends View {
     static final int CT_MOUSE = 4;
     static final int LIST_MORE = 21;
     static final int LIST_APPEAR = 39;
+    /** 更多选项 → 优先级：一条可拖的条，0 最低 / 100 最高。 */
     static final int LIST_COMBO_EDIT = 24;
     static final int LIST_COMBO_TYPE = 25;
     static final int COMBO_ACT_PAD = 1;
@@ -408,6 +417,7 @@ abstract class PickList extends View {
     static final int PANEL_FULL = 0;
     static final int ADJ_NONE = 0;
     static final int ADJ_TRIG = 1;
+    /** 优先级条：和力度条同一套拖法，只是改的是图层优先级。 */
     static final int ADJ_STICK = 2;
     static final int SL_COUNT = 3;
     /**
@@ -422,6 +432,8 @@ abstract class PickList extends View {
     static final String[] SL_TEXT_SHAPE = {"长", "宽", ""};
     /** 摇杆设置下的第一条：范围。第二条以后留着扩展。 */
     static final String[] SL_TEXT_STICK = {"范围", "", ""};
+    /** 优先级子面板下的第一条：图层优先级。第二条以后留着扩展。 */
+    static final String[] SL_TEXT_PRIO = {"优先级", "", ""};
     static final float NO_BOTTOM_LIMIT = 0f;
     static final int CAT_ALL = 0;
     static final int CAT_PAD = 1;
@@ -533,6 +545,16 @@ abstract class PickList extends View {
     abstract float radiusOf(int i);
     abstract void openGridCfg();
     abstract void openFixedCfg();
+    /**
+     * 打开「优先级」子面板（面板原地换成优先级那条滑条）。
+     *
+     * 【为什么必须声明在这里】
+     *   PickList 是父类，GamepadView 是子类。父类里点「优先级」要切面板子模式，
+     *   调的就是子类实现的那个方法 —— 父类看不见子类的成员，
+     *   不在这里留一条 abstract，编译器就报 Unknown method。
+     *   和 openGridCfg / openFixedCfg 是同一套路。
+     */
+    abstract void openPrioPanel();
     abstract boolean isStickElem(int i);
     abstract float halfW(int i);
     abstract float halfH(int i);
@@ -577,6 +599,8 @@ abstract class PickList extends View {
     abstract String gridRowName(int pos);
     abstract int fixState(int tpl, int code);
     abstract void drawTrigRow(Canvas c, int pos, RectF r);
+    /** 优先级条拖出来的值刷给当前选中的元素（在子类里改 PadLayout）。 */
+    abstract void applyPrio(int v);
     abstract void drawStickXyRow(Canvas c, int pos, RectF r);
     abstract void drawGridRow(Canvas c, int pos, RectF r);
     abstract void drawComboRowButtons(Canvas c, int pos);
@@ -1053,12 +1077,13 @@ abstract class PickList extends View {
             mSelSet[i] = false;
         }
         // 【子模式必须跟着退】
-        //   形状 / 摇杆设置都是"针对选中项"的子模式，没选中了就该退出。
+        //   形状 / 摇杆设置 / 优先级都是"针对选中项"的子模式，没选中了就该退出。
         //   留着 mShapeMode=true 而 mSel=NONE 的话，滑条绘制会去读
         //   mLayout.widthMul[-1] —— 下标 -1，直接数组越界崩溃。
         //   （实测：形状模式下点画布空白处就崩，就是这里。）
         mShapeMode = false;
         mStickCfg = false;
+        mPrioMode = false;
         mSel = NONE;
         mAdjLayoutMode = false;
         mAdjAnchor = NONE;
@@ -3217,7 +3242,7 @@ abstract class PickList extends View {
     private float maxSliderLabelWidth() {
         mBarTextPaint.setTextSize(mPanelH * 0.115f);
         float w = 0f;
-        String[][] all = {SL_TEXT, SL_TEXT_SHAPE, SL_TEXT_STICK};
+        String[][] all = {SL_TEXT, SL_TEXT_SHAPE, SL_TEXT_STICK, SL_TEXT_PRIO};
         for (int g = 0; g < all.length; g++) {
             for (int i = 0; i < all[g].length; i++) {
                 // 名字是左对齐画在 dp(10) 处，所以直接量它占多宽
@@ -3466,6 +3491,10 @@ abstract class PickList extends View {
         float tinset = dp(14f);
         float tbh = dp(30f);
         float tcy = tr.top + (tr.height() - dp(24f)) / 2f;
+        // 力度条和优先级条共用这一份排版，另一条清空 ——
+        // 留着旧坐标会变成看不见但点得到的幽灵控件。
+        // 力度条不再和优先级条共用排版 —— 优先级改成了面板子模式，
+        // 列表里只剩下扳机力度这一条。
         mTrigBarRect.set(tr.left + tinset, tcy - tbh / 2f,
                 tr.right - tinset, tcy + tbh / 2f);
 
@@ -4933,6 +4962,22 @@ abstract class PickList extends View {
                 mComboInSub = false;
                 mComboEditDir = 0;
                 openComboEditList(mSel);
+            } else if (name != null && name.startsWith("优先级")) {
+                // 【必须用 startsWith，不能用 equals】
+                //   这行的名字是带当前值的 —— moreRowNames() 里拼成
+                //   "优先级：50"，而这里写死 .equals("优先级")，
+                //   选中了按键就永远匹配不上，if-else 链一路落到末尾，
+                //   什么都不做、只是 invalidate —— 表现就是"点了没反应"。
+                //   行尾带值是为了进去之前就能看到现在是多少，值得留着，
+                //   所以改判定而不是改行名。其余三行（外观 / 摇杆设置 /
+                //   编辑组合键）不带后缀，equals 没问题。
+                //
+                // 【走面板子模式，不再弹列表】
+                //   形状 / 摇杆设置都是原地换面板内容，只有优先级弹一层列表
+                //   还要再点「确定」，同一个软件两种调节方式看着像两套东西。
+                //   面板模式下拖完即生效并存档，和别的滑条一致。
+                openPrioPanel();
+                return;
             } else if ("外观".equals(name)) {
                 // 记下槽位：子列表里三项都要改"当前这个键"，
                 // 而打开色板之类会切走 mSel，不先存就改错对象。

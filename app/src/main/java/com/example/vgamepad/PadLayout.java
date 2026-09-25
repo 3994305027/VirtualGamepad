@@ -280,6 +280,41 @@ public final class PadLayout {
     /** 数组总长：... + G + 鼠标六个 */
     public static final int N = I_MOUSE_WD + 1;
 
+    // ---- 优先级（图层顺序）----
+    //
+    // 谁盖住谁、点重叠处时先判谁，都由这个数决定：数大的在上面、先命中。
+    // 「收」这类界面按钮恒为上限，用户改不了。
+    /** 优先级上限。100 为最高 —— 「收」按钮就是这个值。 */
+    public static final int PRIO_MAX = 100;
+    /** 普通元素默认优先级：大家同级，先后仍按类型决定，和以前一致。 */
+    public static final int PRIO_DEFAULT = 50;
+    /**
+     * 触摸板默认优先级：除空白之外最低。
+     *
+     * 它是铺在下半屏的一大块拖动区，压在按键上面的话，
+     * 被它盖住的键就点不到了 —— 所以它默认垫在按键之下。
+     */
+    public static final int PRIO_MOUSE_PAD = 1;
+    /** 空白按钮默认优先级：垫底的背景板，最低。 */
+    public static final int PRIO_BLANK = 0;
+
+    /** 老存档没有优先级字段时，按元素种类给默认值。 */
+    public static int defaultPrioOf(int i) {
+        if (i == I_MOUSE_PAD) {
+            return PRIO_MOUSE_PAD;
+        }
+        if (i >= BLANK_START && i < COMBO_START) {
+            return PRIO_BLANK;
+        }
+        return PRIO_DEFAULT;
+    }
+
+    public static int clampPrio(int v) {
+        if (v < 0) return 0;
+        if (v > PRIO_MAX) return PRIO_MAX;
+        return v;
+    }
+
     /** 鼠标元素槽位：触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下 */
     public static boolean isMouseSlot(int i) {
         return i >= I_MOUSE_PAD && i <= I_MOUSE_WD;
@@ -1306,6 +1341,7 @@ public final class PadLayout {
         blankUsed[i] = true;
         rx[i] = 0.5f;
         ry[i] = 0.45f;
+        prio[i] = PRIO_BLANK;
         scale[i] = 1f;
         alpha[i] = 1f;
         hidden[i] = false;
@@ -1659,6 +1695,15 @@ public final class PadLayout {
     public final float[] ry = new float[N];
     public final float[] scale = new float[N];
     public final float[] alpha = new float[N];
+    /**
+     * 每个元素的图层优先级：数大的画在上面、点的时候先命中。
+     * 见 PRIO_* 常量。
+     */
+    public final int[] prio = new int[N];
+
+    {
+        java.util.Arrays.fill(prio, PRIO_DEFAULT);
+    }
     /**
      * 隐藏标记：true 的按钮在编辑模式下画叉（还能看见、还能拖，
      * 否则就再也找不回来了），非编辑模式下完全不画也点不到。
@@ -2557,6 +2602,7 @@ public final class PadLayout {
             hidden[i] = false;
             rx[i] = 0.5f;
             ry[i] = 0.45f;
+            prio[i] = defaultPrioOf(i);
         }
         layoutUiButtons(w, h, portrait, /*showLayoutBtn=*/ true);
     }
@@ -2599,6 +2645,8 @@ public final class PadLayout {
         customName[I_MOUSE_PAD] = "触摸板";
         showLabel[I_MOUSE_PAD] = true;
         alpha[I_MOUSE_PAD] = MOUSE_PAD_ALPHA;
+        // 一大块拖动区，垫在按键下面，别把下面盖住
+        prio[I_MOUSE_PAD] = PRIO_MOUSE_PAD;
 
         // ---- 左键 / 右键 ----
         float btnR = Math.min(w, h) * 0.075f;
@@ -2617,6 +2665,7 @@ public final class PadLayout {
             ry[i] = portrait ? 0.34f : 0.36f;
             customName[i] = bn[k];
             showLabel[i] = true;
+            prio[i] = PRIO_DEFAULT;
         }
 
         // ---- 中键 / 滚轮上 / 滚轮下 ----
@@ -2640,6 +2689,7 @@ public final class PadLayout {
             ry[i] = portrait ? eyP[k] : eyL[k];
             customName[i] = en[k];
             showLabel[i] = true;
+            prio[i] = PRIO_DEFAULT;
         }
     }
 
@@ -2676,6 +2726,7 @@ public final class PadLayout {
         }
         showLabel[i] = true;
         customName[i] = mouseNameOf(which);
+        prio[i] = defaultPrioOf(which);
     }
 
     /** 删掉一个鼠标元素，槽位回收（padType 归 0）。 */
@@ -2697,6 +2748,13 @@ public final class PadLayout {
      * @param showLayoutBtn 新建布局 / 键盘布局传 true，系统默认手柄传 false
      */
     private void layoutUiButtons(int w, int h, boolean portrait, boolean showLayoutBtn) {
+        // 界面按钮（编/布/透/收/G）恒在最上层 —— 优先级锁死在上限，
+        // 用户改不了，也不参与元素之间的排序（见 GamepadView.buildOrder）。
+        for (int i = 0; i < N; i++) {
+            if (isUiButton(i)) {
+                prio[i] = PRIO_MAX;
+            }
+        }
         float uex = 0.06f * w;
         float uy = mTopLimit + Math.min(w, h) * 0.045f;
         float ugap = Math.min(w, h) * 0.065f * 2.0f;
@@ -3057,6 +3115,8 @@ public final class PadLayout {
                 l.ry[i] = (float) e.optDouble("y", l.ry[i]);
                 l.scale[i] = clampScale((float) e.optDouble("s", l.scale[i]));
                 l.alpha[i] = clampAlpha((float) e.optDouble("a", l.alpha[i]));
+                // 老存档没有 "pr"，按种类给默认值（触摸板自动垫到按键下面）
+                l.prio[i] = clampPrio(e.optInt("pr", PadLayout.defaultPrioOf(i)));
                 l.hidden[i] = e.optBoolean("h", false);
                 // 老存档没有 "k"，optInt 返回 0 = 空槽位，自动兼容。
                 l.keyCode[i] = e.optInt("k", 0);
@@ -3586,6 +3646,7 @@ public final class PadLayout {
                 e.put("y", ry[i]);
                 e.put("s", scale[i]);
                 e.put("a", alpha[i]);
+                e.put("pr", prio[i]);
                 e.put("h", hidden[i]);
                 e.put("k", keyCode[i]);
                 e.put("sp", shape[i]);

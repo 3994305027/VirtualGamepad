@@ -471,6 +471,12 @@ public class GamepadView extends PickList {
         //
         //   （形状已并入外观：它改的也是这个键长什么样，单列反而分散。）
         a.add("外观");
+        // 【优先级固定在第 2 位】
+        //   谁盖住谁是叠放时最先要调的，位置不能因为我往后加行就往下掉。
+        // 【行尾带上当前值】
+        //   进去之前就能看到现在是多少，不用专门点进去看一眼再退出来。
+        //   多选时没有一个"当前值"可显示，保持原样。
+        a.add((mSel != NONE) ? ("优先级：" + mLayout.prio[mSel]) : "优先级");
         if (selHasStick()) {
             a.add("摇杆设置");
         }
@@ -553,17 +559,38 @@ public class GamepadView extends PickList {
      */
 
     /**
-     * 当前是不是停在某个子模式里（形状 / 摇杆设置）。
+     * 当前是不是停在某个子模式里（形状 / 摇杆设置 / 优先级）。
      * 决定要不要画「返回」。
      */
     boolean inSubMode() {
-        return mShapeMode || mStickCfg;
+        return mShapeMode || mStickCfg || mPrioMode;
     }
 
     /** 退出子模式，回到常规编辑面板。 */
     private void exitSubMode() {
         mShapeMode = false;
         mStickCfg = false;
+        mPrioMode = false;
+        invalidate();
+    }
+
+    /**
+     * 打开「优先级」子面板：面板原地换成优先级那条滑条。
+     *
+     * 【为什么走面板子模式而不是再弹一层列表】
+     *   和形状 / 摇杆设置保持一致 —— 那两个都是原地换面板内容，
+     *   唯独优先级弹一个独立列表，进去还要再点「确定」，
+     *   同一个软件里两种调节方式，看着像两套东西。
+     *
+     *   走面板后拖完即生效并存档，不用确定，和别的滑条一样。
+     */
+    void openPrioPanel() {
+        closeList();
+        mShapeMode = false;
+        mStickCfg = false;
+        mPrioMode = true;
+        mRayElem = NONE;
+        setPanelState(PANEL_FULL);
         invalidate();
     }
     /** 形状模式里的「圆形」「四边形」两个选项 */
@@ -1764,8 +1791,10 @@ public class GamepadView extends PickList {
         mSel = NONE;
                     mRayElem = NONE;
         mSlDrag = NONE;
-        // 形状模式跟着一起退：下次进来停在形状屏会让人以为滑条少了一条
+        // 形状模式跟着一起退：下次进来停在形状屏会让人以为滑条少了一条。
+        // 优先级同理 —— 它是子模式，留着会直接停在只有一条滑条的屏上。
         mShapeMode = false;
+        mPrioMode = false;
         mSlDragPointer = NONE;
         // 关联 / 点选都是一次性的，进出编辑模式都清掉，
         // 免得下次进来还挂着上一轮的联动组。
@@ -1803,6 +1832,7 @@ public class GamepadView extends PickList {
         mSlDrag = NONE;
         mSlDragPointer = NONE;
         mShapeMode = false;
+        mPrioMode = false;
         // 网格配置面板是编辑期的，退出编辑要一起收掉，
         // 否则下次进编辑会直接停在配置面板上。
         mGridCfg = false;
@@ -1893,6 +1923,95 @@ public class GamepadView extends PickList {
      * 编辑模式下隐藏的仍然可点，否则就再也选不中、恢复不回来了。
      */
 
+    // ---- 图层顺序：由优先级决定谁在上面、谁先命中 ----
+    //
+    // 【为什么要有这套排序】
+    //   以前绘制和命中都是"按类型分几趟循环"写死的：
+    //   空白 → 轴类 → 圆按钮 → 鼠标 → 键盘 → 组合键。
+    //   于是触摸板（鼠标那趟）永远压在所有按键之上、也永远先命中 ——
+    //   它铺在下半屏，被它盖住的键就点不到了。
+    //
+    //   现在给每个元素一个优先级，主排序键就是它；
+    //   优先级相同时按"类型档位"排，档位的顺序和原来那几趟循环一致，
+    //   所以没动过优先级的布局和以前一模一样。
+    private final int[] mDrawOrd = new int[PadLayout.N];
+    private final int[] mHitOrd = new int[PadLayout.N];
+    private final long[] mOrdKey = new long[PadLayout.N];
+    private int mOrdN = 0;
+
+    /** 绘制档位（小的先画 = 在下层）。 */
+    private int drawTierOf(int i) {
+        if (mLayout.isBlankUsed(i)) return 0;
+        if (mLayout.isMouseUsed(i)) return 3;
+        if (mLayout.isKeySlotUsed(i)) return 4;
+        if (mLayout.isComboUsed(i)) return 5;
+        if (isAxisType(mLayout.padType[i])) return 1;
+        return 2;
+    }
+
+    /** 命中档位（小的先判 = 上层）。顺序和原来那几趟循环一致。 */
+    private int hitTierOf(int i) {
+        if (mLayout.isMouseUsed(i)) return 0;
+        int pt = mLayout.padType[i];
+        if (isAxisType(pt)) {
+            int proto = PadLayout.protoOfType(pt);
+            if (proto == PadLayout.I_LS || proto == PadLayout.I_RS) return 1;
+            if (proto == PadLayout.I_DPAD) return 2;
+            return 3;
+        }
+        return 4;
+    }
+
+    /**
+     * 重排绘制 / 命中顺序。
+     *
+     * 每帧重排一次：N 一百多个，排序开销远小于一次 drawText，
+     * 但省掉了"改了优先级却没重建顺序"这种最难查的错位。
+     */
+    private void buildOrder(boolean forHit) {
+        int n = 0;
+        for (int i = 0; i < PadLayout.N; i++) {
+            if (!pickable(i) || PadLayout.isUiButton(i)) {
+                continue;
+            }
+            int pr = mLayout.prio[i];
+            int tier = forHit ? hitTierOf(i) : drawTierOf(i);
+            // 命中要"优先级高的先判"，取反后统一按升序排
+            long pk = forHit ? (PadLayout.PRIO_MAX - pr) : pr;
+            mOrdKey[n] = (pk << 12) | ((long) tier << 8) | (long) i;
+            n++;
+        }
+        java.util.Arrays.sort(mOrdKey, 0, n);
+        int[] dst = forHit ? mHitOrd : mDrawOrd;
+        for (int j = 0; j < n; j++) {
+            dst[j] = (int) (mOrdKey[j] & 0xFFL);
+        }
+        mOrdN = n;
+    }
+
+    /** 按元素类型分派命中判定：鼠标矩形 / 摇杆 1.35 / 十字键 1.15 / 扳机矩形 / 其余 1.25。 */
+    private boolean hitAnyElem(int i, float x, float y) {
+        if (mLayout.isMouseUsed(i)) {
+            return Math.abs(x - mPx[i]) <= halfW(i)
+                    && Math.abs(y - mPy[i]) <= halfH(i);
+        }
+        int pt = mLayout.padType[i];
+        if (isAxisType(pt)) {
+            int proto = PadLayout.protoOfType(pt);
+            if (proto == PadLayout.I_LS || proto == PadLayout.I_RS) {
+                return dist(x, y, mPx[i], mPy[i]) <= radiusOf(i) * 1.35f;
+            }
+            if (proto == PadLayout.I_DPAD) {
+                return dist(x, y, mPx[i], mPy[i]) <= radiusOf(i) * 1.15f;
+            }
+            float r = radiusOf(i) * 1.25f;
+            float hy = trackHalfH(i) + Math.min(mW, mH) * 0.01f;
+            return x >= mPx[i] - r && x <= mPx[i] + r
+                    && y >= mPy[i] - hy && y <= mPy[i] + hy;
+        }
+        return hitElem(i, x, y, 1.25f);
+    }
+
     private int hitElement(float x, float y) {
         // 界面按钮：按 UI_Z 表判定，和绘制顺序同源 —— 见 UI_Z 的说明。
         int ui = hitUiButton(x, y);
@@ -1905,92 +2024,21 @@ public class GamepadView extends PickList {
           后面那几趟循环根本看不到 —— 必须在这里单独判。
           触摸板是大矩形，用矩形判定而不是圆，否则四个角点不到。
         */
-        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
-            if (!pickable(i) || !mLayout.isMouseUsed(i)) {
-                continue;
-            }
-            float hw = halfW(i);
-            float hh = halfH(i);
-            if (Math.abs(x - mPx[i]) <= hw && Math.abs(y - mPy[i]) <= hh) {
-                return i;
-            }
-        }
-        // 【所有循环都改成"按 proto 遍历全部槽位"】
-        //
-        // 原来是写死的下标区间：
-        //   摇杆 i=0..1、十字键 i=2、扳机 i=9..10、按钮 i=3..12 / i=15..131
-        // 新建的手柄元素落在副本槽位 133..164，**一个循环都覆盖不到**，
-        // 于是"画得出来、点不到也拖不动"。
-        //
-        // 而且副本槽位上的摇杆/十字键/扳机，就算进了最后一个循环，
-        // 判定倍率也不对（它们是 1.35 / 1.15 / 矩形轨道，不是 1.25 圆）。
-        // 所以按 proto 分类遍历，各自用各自的倍率。
+        /*
+          所有元素按优先级从高到低判一次。
 
-        // 两个摇杆谁近算谁的，避免拉大后判定圈重叠时串到另一个摇杆上
-        int best = NONE;
-        float bestD = Float.MAX_VALUE;
-        for (int i = 0; i < PadLayout.N; i++) {
-            if (!pickable(i) || !isAxisType(mLayout.padType[i])) {
-                continue;
-            }
-            int proto = PadLayout.protoOfType(mLayout.padType[i]);
-            if (proto != PadLayout.I_LS && proto != PadLayout.I_RS) {
-                continue;
-            }
-            float d = dist(x, y, mPx[i], mPy[i]);
-            if (d <= radiusOf(i) * 1.35f && d < bestD) {
-                bestD = d;
-                best = i;
-            }
-        }
-        if (best != NONE) {
-            return best;
-        }
-        for (int i = 0; i < PadLayout.N; i++) {
-            if (!pickable(i) || !isAxisType(mLayout.padType[i])) {
-                continue;
-            }
-            if (PadLayout.protoOfType(mLayout.padType[i]) != PadLayout.I_DPAD) {
-                continue;
-            }
-            if (dist(x, y, mPx[i], mPy[i]) <= radiusOf(i) * 1.15f) {
-                return i;
-            }
-        }
-        // L2 / R2 是竖直滑轨，判定用矩形而不是圆：
-        // 用圆的话轨道上下两端（滑块够不到的地方）点不到，
-        // 想从轨道上部按下扣扳机就会落空。
-        // 步长必须是 1：I_L2=9、I_R2=10 是挨着的两个下标。
-        // 之前写成 i += 2，循环只在 i=9 跑了一次就跳到 11 退出，
-        // 结果 R2 从来没进过命中判定 —— 点它等于点空白，怎么点都没反应。
-        for (int i = 0; i < PadLayout.N; i++) {
-            if (!pickable(i) || !isAxisType(mLayout.padType[i])) {
-                continue;
-            }
-            int pt = PadLayout.protoOfType(mLayout.padType[i]);
-            if (pt != PadLayout.I_L2 && pt != PadLayout.I_R2) {
-                continue;
-            }
-            float r = radiusOf(i) * 1.25f;
-            float hy = trackHalfH(i) + Math.min(mW, mH) * 0.01f;
-            if (x >= mPx[i] - r && x <= mPx[i] + r
-                    && y >= mPy[i] - hy && y <= mPy[i] + hy) {
-                return i;
-            }
-        }
+          【为什么换成一趟】
+            以前是"鼠标 → 摇杆 → 十字键 → 扳机 → 其余"五趟写死的循环，
+            触摸板永远第一个被判到 —— 它铺在下半屏，
+            被它盖住的按键就永远点不到了，改优先级也救不回来。
 
-        // 其余所有元素（圆按钮 + 键盘键）：统一 1.25 倍，跟着形状走。
-        // 遍历 0..N 而不是写死区间 —— 副本槽位（133+）必须覆盖到，
-        // 否则新建的手柄元素画得出来却点不到。
-        for (int i = 0; i < PadLayout.N; i++) {
-            if (!pickable(i)) {
-                continue;
-            }
-            // 轴类（摇杆 / 十字键 / 扳机）已在上面用各自倍率判过，跳过
-            if (isAxisType(mLayout.padType[i])) {
-                continue;
-            }
-            if (hitElem(i, x, y, 1.25f)) {
+            现在顺序由 buildOrder() 算出来，优先级是主排序键，
+            所以把触摸板的优先级调低，它就真的排到按键后面去。
+        */
+        buildOrder(true);
+        for (int k = 0; k < mOrdN; k++) {
+            int i = mHitOrd[k];
+            if (hitAnyElem(i, x, y)) {
                 return i;
             }
         }
@@ -2044,7 +2092,10 @@ public class GamepadView extends PickList {
             return NONE;
         }
         int n = (mShapeMode && mSel != NONE) ? 2 : SL_COUNT;
-        if (mStickCfg && selHasStick()) {
+        if (mPrioMode) {
+            // 优先级子面板：整块面板就这一条
+            n = 1;
+        } else if (mStickCfg && selHasStick()) {
             // 固定摇杆开着时范围没有意义 —— 不给拖，
             // 拖了也是白拖（代码里不读这个值）。
             int ref = firstStickInSel();
@@ -3133,6 +3184,15 @@ public class GamepadView extends PickList {
     // ------------------------------------------------------------------
 
     private float sliderValue(int i) {
+        // 【优先级子面板排在 isMulti() 之前】
+        //   多选时 isMulti() 为真，它会返回批量缓存值（大小 / 字体 / 透明），
+        //   于是多选 + 优先级读到的其实是"大小" —— 和摇杆设置踩的是同一个坑。
+        if (mPrioMode) {
+            if (i != 0) {
+                return 0f;
+            }
+            return PadLayout.clampPrio(curPrio()) / 100f;
+        }
         //
         // 【摇杆设置必须排在 isMulti() 之前】
         //   多选时 isMulti() 为真，以前它排在最前面，直接返回批量缓存值
@@ -3283,6 +3343,15 @@ public class GamepadView extends PickList {
     }
 
     private void applySlider(int i, float x) {
+        // 【优先级子面板排在 isMulti() 之前】同上：不然多选时拖的是"大小"。
+        if (mPrioMode) {
+            RectF pt = mSlTrack[0];
+            float pv = pt.width() <= 0f ? 0f : (x - pt.left) / pt.width();
+            if (pv < 0f) pv = 0f;
+            if (pv > 1f) pv = 1f;
+            applyPrio(Math.round(pv * 100f));
+            return;
+        }
         //
         // 【摇杆设置必须排在 isMulti() 之前】
         //   以前 isMulti() 在最前面，多选时直接走 applyMultiSlider()，
@@ -4934,6 +5003,68 @@ public class GamepadView extends PickList {
         Paint.FontMetrics f4 = mBarTextPaint.getFontMetrics();
         c.drawText("扣下 " + mTrigPct + "%", r.centerX(),
                 r.bottom - dp(4f) - (f4.ascent + f4.descent) / 2f, mBarTextPaint);
+    }
+
+    /**
+     * 当前要显示 / 要改的那个元素的优先级（面板子模式里那条滑条读它）。
+     *
+     * 【为什么不记一个"槽位快照"】
+     *   面板子模式下 mSel 是会变的（点画布上别的键就换了选中项），
+     *   记快照会让滑条一直读旧元素的值、拖了也改到旧元素上 ——
+     *   形状 / 摇杆设置用的都是 mSel，跟着当前选中走，这里保持一致。
+     *   多选时 mSel 是 NONE，退回看选中集合里的第一个。
+     */
+    private int curPrio() {
+        if (mLayout == null) {
+            return PadLayout.PRIO_DEFAULT;
+        }
+        int i = mSel;
+        if (i == NONE) {
+            for (int k = 0; k < PadLayout.N; k++) {
+                if (mSelSet[k]) {
+                    i = k;
+                    break;
+                }
+            }
+        }
+        if (i == NONE) {
+            return PadLayout.PRIO_DEFAULT;
+        }
+        return mLayout.prio[i];
+    }
+
+    /** 拖条出来的值刷给选中的元素，立刻生效并存档。 */
+    void applyPrio(int v) {
+        if (mLayout == null) {
+            return;
+        }
+        int val = PadLayout.clampPrio(v);
+        int one = mSel;
+        // 界面按钮（编/布/透/收/G）永远最上层，调它没有意义 —— 说清楚，
+        // 别让人拖了半天以为没生效。
+        if (one != NONE && PadLayout.isUiButton(one)) {
+            toastLocal("界面按钮始终在最上层");
+            return;
+        }
+        boolean changed = false;
+        if (isMulti()) {
+            for (int i = 0; i < PadLayout.N; i++) {
+                if (mSelSet[i] && mLayout.prio[i] != val) {
+                    mLayout.prio[i] = val;
+                    changed = true;
+                }
+            }
+        } else {
+            int i = mSel;
+            if (i != NONE && mLayout.prio[i] != val) {
+                mLayout.prio[i] = val;
+                changed = true;
+            }
+        }
+        if (changed) {
+            mLayout.save(getContext());
+        }
+        invalidate();
     }
 
     /** 组合键里第一格还没设的动作，没有返回 -1。 */
@@ -7278,62 +7409,27 @@ public class GamepadView extends PickList {
             drawGrid(c);
         }
 
-        // 【空白按钮先画 = 图层最低】
-        //
-        //   它是拿来垫底的背景板（不映射任何键），压在别的按钮上面没意义。
-        //   画在后面的盖在上面，所以放到所有按键循环**之前**。
-        //
-        //   倒序遍历：槽位越大 = 建得越晚，先画就被压在下面，
-        //   于是"新创建的空白优先级更低"，不会盖住先建的。
-        //
-        //   （它 padType 恒 0、也不是键盘槽位，只能单独一个循环，
-        //    否则建得出来、画不出来。）
-        for (int i = PadLayout.COMBO_START - 1; i >= PadLayout.BLANK_START; i--) {
+        /*
+          所有元素按优先级从低到高画一遍：画在后面的盖在上面。
+
+          以前是"空白 → 轴类 → 圆按钮 → 鼠标 → 键盘 → 组合键"六趟写死的循环，
+          触摸板（鼠标那趟）永远画在按键之后 = 压在按键上面。
+          现在顺序由 buildOrder() 算，优先级低的元素先画 ——
+          触摸板默认垫底，按键照常压在它上面。
+        */
+        buildOrder(false);
+        for (int k = 0; k < mOrdN; k++) {
+            int i = mDrawOrd[k];
             if (mLayout.isBlankUsed(i)) {
                 drawBlankBtn(c, i);
-            }
-        }
-
-        // 【按槽位遍历，不再硬编码每个下标】
-        //
-        // 手柄元素现在能删、也能建多份，"下标 == 某种键"不再成立。
-        // 所以改成遍历所有槽位、按 padType 决定画成什么。
-        //
-        // 分两趟是为了保持原来的层次：轴类（摇杆 / 十字键 / 扳机）在底层，
-        // 圆按钮在上层 —— 叠在一起时按钮压着摇杆，和以前一致。
-        for (int i = 0; i < PadLayout.N; i++) {
-            if (mLayout.isPadUsed(i) && isAxisType(mLayout.padType[i])) {
-                drawElem(c, i);
-            }
-        }
-        for (int i = 0; i < PadLayout.N; i++) {
-            if (mLayout.isPadUsed(i) && !isAxisType(mLayout.padType[i])) {
-                drawElem(c, i);
-            }
-        }
-        // 鼠标三件套。
-        // 它们的下标在数组末尾（I_FLOAT 之后），不在 isPadSlot 范围内，
-        // 主循环那两趟按 isPadUsed 过滤，会直接把它们跳过 ——
-        // 所以和空白按钮一样单独一趟，画在普通按键之上。
-        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
-            if (mLayout.isMouseUsed(i)) {
-                drawElem(c, i);
-            }
-        }
-        // 动态创建的键盘按键。只画已创建的（空槽位由 shouldDraw 挡掉）。
-        // 名字来自它创建时选的键，比如 "W"、"空格"。
-        for (int i = PadLayout.I_KEY0; i < PadLayout.N_KEY_END; i++) {
-            if (mLayout.isKeySlotUsed(i)) {
-                drawBtn(c, i, PadLayout.keyName(mLayout.keyCode[i]));
-            }
-        }
-        // 组合键：背景 + 名字。
-        // 同样要单独一个循环 —— 它不是手柄元素（padType 恒 0）、
-        // 不是键盘槽位、也不是空白槽位，上面三个循环都覆盖不到。
-        for (int i = PadLayout.COMBO_START;
-             i < PadLayout.COMBO_START + PadLayout.MAX_COMBO; i++) {
-            if (mLayout.isComboUsed(i)) {
+            } else if (mLayout.isComboUsed(i)) {
                 drawComboBtn(c, i);
+            } else if (mLayout.isMouseUsed(i)) {
+                drawElem(c, i);
+            } else if (mLayout.isKeySlotUsed(i)) {
+                drawBtn(c, i, PadLayout.keyName(mLayout.keyCode[i]));
+            } else {
+                drawElem(c, i);
             }
         }
         // 编辑模式下给隐藏的按钮打叉：还能看见、还能选中、还能拖，
@@ -8466,7 +8562,7 @@ public class GamepadView extends PickList {
         float tipY = mPanelTop + mPanelH * 0.09f - (fm.ascent + fm.descent) / 2f;
         // 多选时提示行左端排了「更多选项 / 返回 / 布局调节 / 中心」，
         // 再居中就会和按钮叠在一起 —— 改成从按钮右边开始左对齐。
-        if (isMulti() && !mGridCfg && !mShapeMode && !mStickCfg) {
+        if (isMulti() && !mGridCfg && !mShapeMode && !mStickCfg && !mPrioMode) {
             float start = mAdjLayoutMode ? mMultiCenBtnRect.right : mMultiLayBtnRect.right;
             mBarTextPaint.setTextAlign(Paint.Align.LEFT);
             // 余下的宽度可能不够，按可用宽度缩字号，别顶出屏幕
@@ -8484,7 +8580,7 @@ public class GamepadView extends PickList {
         // 左上角「更多选项」入口。停在形状模式时高亮，
         // 和「常用工具」一个逻辑 —— 提示"你现在在哪个子模式里"。
         // 多选面板下这个位置改画「布局调节」+「中心」，两者互斥。
-        boolean shapeOn = mShapeMode && mSel != NONE;
+        boolean shapeOn = (mShapeMode && mSel != NONE) || mPrioMode;
         // 多选时「更多选项」也高亮一下，提示"这批按钮还有批量设置可进"，
         // 但只在常规面板下 —— 子模式里本来就有「返回」在提示了。
         if (!mGridCfg) {
@@ -8522,7 +8618,7 @@ public class GamepadView extends PickList {
         //   于是多选状态下"形状"等入口全没了 —— 只能先退出多选才调得了。
         //   现在更多 / 返回照常画，布局调节和中心跟在它们右边，
         //   只画"布局调节"两个字的宽度，中心按钮只在布局调节打开时才出现。
-        if (isMulti() && !mGridCfg && !mShapeMode && !mStickCfg) {
+        if (isMulti() && !mGridCfg && !mShapeMode && !mStickCfg && !mPrioMode) {
             // 「布局调节」开关：开着时高亮，一眼能看出当前是哪种缩放语义
             c.drawRoundRect(mMultiLayBtnRect, dp(6f), dp(6f),
                     mAdjLayoutMode ? mSlFillPaint : mToolBtnPaint);
@@ -8592,6 +8688,9 @@ public class GamepadView extends PickList {
             drawSlider(c, 0, refS != NONE && mLayout.stickFixed[refS]);
             // 第一行：固定摇杆开关
             drawStickFixedRow(c);
+        } else if (mPrioMode) {
+            // 优先级子面板：整块面板只有这一条，和第三行的形状选项互斥
+            drawSlider(c, 0);
         } else if (!isMultiShape()) {
             for (int i = 0; i < (sm ? 2 : SL_COUNT); i++) {
                 drawSlider(c, i);
@@ -8691,6 +8790,10 @@ public class GamepadView extends PickList {
         if (mGridCfg) {
             return gridTip();
         }
+        if (mPrioMode) {
+            return "优先级：数大的压在上面（触摸板默认 1，界面按钮恒 100）"
+                    + (isMulti() ? " — 拖这一条，选中的 " + selCount() + " 个一起改" : "");
+        }
         if (isMultiShape()) {
             return "多选形状：点「圆形」或「四边形」，把选中的 "
                     + selCount() + " 个按钮一次性刷成它";
@@ -8764,15 +8867,19 @@ public class GamepadView extends PickList {
         // 摇杆设置下第一条是"范围"。以前没有这个分支，显示的是 SL_TEXT[0]
         // 也就是"大小" —— SL_TEXT_STICK 定义了却一直没用上，
         // 于是那条拖的是范围、写的却是"大小"，直接把人带偏。
-        String slName = (mStickCfg && selHasStick())
-                ? SL_TEXT_STICK[i] : (mShapeMode ? SL_TEXT_SHAPE[i] : SL_TEXT[i]);
+        String slName = mPrioMode ? SL_TEXT_PRIO[i]
+                : ((mStickCfg && selHasStick())
+                ? SL_TEXT_STICK[i] : (mShapeMode ? SL_TEXT_SHAPE[i] : SL_TEXT[i]));
         c.drawText(slName, dp(10f), base, mBarTextPaint);
 
         mBarTextPaint.setTextAlign(Paint.Align.RIGHT);
         // 形状模式下百分比没意义（区间是 0.3~8 倍），直接显示倍率，
         // 比如 1.19x，方便照着键盘键的默认比例调。
         String valTxt;
-        if (isMulti() && mAdjLayoutMode && i == SL_SIZE) {
+        if (mPrioMode) {
+            // 优先级是 0~100 的整数，印"80%"反而像透明度的那条，直接给数字
+            valTxt = String.valueOf(PadLayout.clampPrio(curPrio()));
+        } else if (isMulti() && mAdjLayoutMode && i == SL_SIZE) {
             // 布局调节下百分比没有意义，直接显示整体倍率
             valTxt = String.format("%.2fx", mAdjK);
         } else if (mShapeMode && mSel != NONE) {
