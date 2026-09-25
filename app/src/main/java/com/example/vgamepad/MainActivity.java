@@ -2367,11 +2367,41 @@ public class MainActivity extends Activity {
                         if (info.code <= currentVersionCode()) {
                             return;
                         }
-                        showUpdateDialog(info);
+                        java.util.ArrayList<UpdateInfo> newer = filterNewer(info.list);
+                        if (newer != null) {
+                            showUpdateDialog(newer);
+                        } else {
+                            showUpdateDialog(info);
+                        }
                     }
                 });
             }
         }).start();
+    }
+
+    /**
+     * 从拉回来的列表里挑出"比当前版本新"的那些。
+     *
+     * 【为什么在这里过滤，而不是拉的时候】
+     *   拉列表的地方还要用 list.get(0) 判断"到底有没有更新"，
+     *   那边必须拿到**没过滤**的结果；只有填弹窗时才要过滤。
+     *   两件事分开，免得一边改了另一边跟着错。
+     *
+     * @return 已排好序（新→旧）。全都不比当前新就返回 null。
+     */
+    private java.util.ArrayList<UpdateInfo> filterNewer(
+            java.util.ArrayList<UpdateInfo> all) {
+        if (all == null || all.isEmpty()) {
+            return null;
+        }
+        int cur = currentVersionCode();
+        java.util.ArrayList<UpdateInfo> out = new java.util.ArrayList<UpdateInfo>();
+        for (UpdateInfo u : all) {
+            if (u != null && u.code > cur) {
+                out.add(u);
+            }
+        }
+        return out.isEmpty() ? null : out;
     }
 
     /** 改标题右边那行状态字。传空串就隐藏。 */
@@ -2438,6 +2468,14 @@ public class MainActivity extends Activity {
     private static class UpdateInfo {
         int code;
         String name = "";
+        /**
+         * 同一个源拉回来的**全部** Release（新→旧），只有 fetchUpdate 会填。
+         *
+         * 弹窗要列"当前 → 最新"之间所有版本，光有最新那个不够；
+         * 但判断"有没有更新"又只需要 list.get(0)。
+         * 两份需求装在一起，省一次网络请求。
+         */
+        java.util.ArrayList<UpdateInfo> list = null;
         String apkUrl = "";        // GitHub 上的 APK 直链
         String htmlUrl = "";       // Release 页面地址（给人看的网页）
         String netdiskUrl = "";    // 网盘地址（可选，给用户多一条路）
@@ -2511,7 +2549,14 @@ public class MainActivity extends Activity {
                             toast("已是最新版本（" + info.name + "）");
                             return;
                         }
-                        showUpdateDialog(info);
+                        java.util.ArrayList<UpdateInfo> newer = filterNewer(info.list);
+                        if (newer != null) {
+                            showUpdateDialog(newer);
+                        } else {
+                            // 拿不到列表（连不上 / 老版本 Release 没写 versionCode）
+                            // 就退回只有一个版本的老弹窗，不能因为列表失败就不弹
+                            showUpdateDialog(info);
+                        }
                     }
                 });
             }
@@ -2520,6 +2565,23 @@ public class MainActivity extends Activity {
 
     /** Release API 优先，失败再依次试 version.json。全失败返回 null。 */
     private UpdateInfo fetchUpdate() {
+        /*
+          【先拉列表，不再只拉 latest】
+            列表接口本身就包含最新那一个，等于一次请求拿到两样东西：
+            info（= 最新，用来判断有没有更新）+ info.list（= 全部，弹窗要用）。
+
+          【列表失败就退回 latest】
+            限流 / 断网 / JSON 变了都可能让它失败。
+            这时不能连"有没有更新"都查不出来 —— 退回原来的单版本流程，
+            最坏情况只是弹窗里没有版本选择器，功能不受影响。
+        */
+        java.util.ArrayList<UpdateInfo> all = fetchReleaseList();
+        if (all != null && !all.isEmpty()) {
+            UpdateInfo info = all.get(0);      // 已按 code 从大到小排好
+            info.list = all;
+            return info;
+        }
+
         UpdateInfo info = fetchLatestRelease();
         if (info == null) {
             for (String base : UPDATE_URLS) {
@@ -2570,44 +2632,120 @@ public class MainActivity extends Activity {
             String body = readAll(c.getInputStream());
 
             org.json.JSONObject o = new org.json.JSONObject(body);
-            UpdateInfo info = new UpdateInfo();
-
-            String tag = o.optString("tag_name", "");
-            info.name = tag.startsWith("v") ? tag.substring(1) : tag;
-
-            // APK 地址：在 assets 里找第一个 .apk
-            org.json.JSONArray assets = o.optJSONArray("assets");
-            if (assets != null) {
-                for (int i = 0; i < assets.length(); i++) {
-                    org.json.JSONObject a = assets.optJSONObject(i);
-                    if (a == null) {
-                        continue;
-                    }
-                    String n = a.optString("name", "");
-                    if (n.toLowerCase().endsWith(".apk")) {
-                        info.apkUrl = a.optString("browser_download_url", "");
-                        break;
-                    }
-                }
-            }
-            if (info.apkUrl.length() == 0) {
-                return null;   // 没挂 APK 就不算一个可用 Release
-            }
-
-            String note = o.optString("body", "");
-            info.changelog = note.trim();
-            info.code = intFromNote(note, "versionCode");
-            info.netdiskUrl = strFromNote(note, "网盘");
-            // API 给的 html_url 就是 Release 页面；万一没有就退回固定地址
-            info.htmlUrl = o.optString("html_url", "");
-            info.from = "api.github.com";
-
-            if (info.code <= 0) {
-                return null;   // 没写 versionCode 就没法比对，走 version.json
-            }
-            return info;
+            return parseRelease(o);
         } catch (Exception e) {
             Log.w("VGamepad", "读 Release 失败", e);
+            return null;
+        } finally {
+            if (c != null) {
+                c.disconnect();
+            }
+        }
+    }
+
+    /**
+     * 把 Releases API 返回的一个 release 对象解析成 UpdateInfo。
+     *
+     * latest 和列表两条路都用它 —— 两边判据必须完全一致，
+     * 否则会出现"latest 说有更新、列表里却找不到它"的对不上。
+     *
+     * @return null = 这个 release 不可用（没挂 APK，或没写 versionCode）。
+     */
+    private static UpdateInfo parseRelease(org.json.JSONObject o) {
+        if (o == null) {
+            return null;
+        }
+        UpdateInfo info = new UpdateInfo();
+
+        String tag = o.optString("tag_name", "");
+        info.name = tag.startsWith("v") ? tag.substring(1) : tag;
+
+        // APK 地址：在 assets 里找第一个 .apk
+        org.json.JSONArray assets = o.optJSONArray("assets");
+        if (assets != null) {
+            for (int i = 0; i < assets.length(); i++) {
+                org.json.JSONObject a = assets.optJSONObject(i);
+                if (a == null) {
+                    continue;
+                }
+                String n = a.optString("name", "");
+                if (n.toLowerCase().endsWith(".apk")) {
+                    info.apkUrl = a.optString("browser_download_url", "");
+                    break;
+                }
+            }
+        }
+        if (info.apkUrl.length() == 0) {
+            return null;   // 没挂 APK 就不算一个可用 Release
+        }
+
+        String note = o.optString("body", "");
+        info.changelog = note.trim();
+        info.code = intFromNote(note, "versionCode");
+        info.netdiskUrl = strFromNote(note, "网盘");
+        // API 给的 html_url 就是 Release 页面；万一没有就退回固定地址
+        info.htmlUrl = o.optString("html_url", "");
+        info.from = "api.github.com";
+
+        if (info.code <= 0) {
+            return null;   // 没写 versionCode 就没法比对
+        }
+        return info;
+    }
+
+    /** Releases 列表（不是 latest 单个）。per_page=100 是 API 上限。 */
+    private static final String API_LIST =
+            "https://api.github.com/repos/3994305027/VirtualGamepad/releases?per_page=100";
+
+    /**
+     * 拉 Releases 列表，按 versionCode 从大到小排好返回。
+     *
+     * 【为什么要整个列表，而不只是 latest】
+     *   latest 只给得出"最新是哪个"。用户在用的往往是很老的版本，
+     *   中间隔了好几个 Release —— 只告诉他最新那个，
+     *   他就不知道中间都改了什么，也不知道可以停在某个中间版本。
+     *   列表让他自己挑：默认停在最新，也能选中间任一个。
+     *
+     * 【这里不过滤旧版本】
+     *   过滤交给调用方：调它的人既要用 list.get(0) 判断"有没有更新"，
+     *   又要用过滤后的结果填列表，两处口径必须一致。
+     *
+     * @return null = 这个源连不上 / 解析失败，调用方去试下一个源。
+     */
+    private java.util.ArrayList<UpdateInfo> fetchReleaseList() {
+        java.net.HttpURLConnection c = null;
+        try {
+            c = (java.net.HttpURLConnection) new java.net.URL(API_LIST).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setRequestMethod("GET");
+            c.setRequestProperty("User-Agent", "VirtualGamepad");
+            c.setRequestProperty("Accept", "application/vnd.github+json");
+            if (c.getResponseCode() != 200) {
+                return null;
+            }
+            String body = readAll(c.getInputStream());
+            org.json.JSONArray arr = new org.json.JSONArray(body);
+            java.util.ArrayList<UpdateInfo> out = new java.util.ArrayList<UpdateInfo>();
+            for (int i = 0; i < arr.length(); i++) {
+                UpdateInfo one = parseRelease(arr.optJSONObject(i));
+                if (one != null) {
+                    out.add(one);
+                }
+            }
+            if (out.isEmpty()) {
+                return null;
+            }
+            // 从大到小：最新的排第一，默认就选它
+            java.util.Collections.sort(out, new java.util.Comparator<UpdateInfo>() {
+                @Override
+                public int compare(UpdateInfo a, UpdateInfo b) {
+                    return b.code - a.code;
+                }
+            });
+            return out;
+        } catch (Exception e) {
+            Log.w("VGamepad", "读 Releases 列表失败", e);
             return null;
         } finally {
             if (c != null) {
@@ -2725,6 +2863,265 @@ public class MainActivity extends Activity {
                 c.disconnect();
             }
         }
+    }
+
+    /**
+     * 更新弹窗 —— 带版本选择器。
+     *
+     * 【为什么要有版本选择器】
+     *   中间隔了好几个 Release 时，只说"最新是 X"会让人错过中间版本：
+     *   既看不到中间都改了什么，也没法停在某个中间版本上。
+     *   现在把"当前版本 → 最新版本"之间所有 Release 列出来让他自己挑。
+     *
+     * 【最多显示两行，超了滚动】
+     *   版本一多，全展开会把更新说明挤出屏幕 —— 说明才是重点。
+     *   所以列表高度固定两行，多了自己滑。
+
+     * 【默认选中最新的】
+     *   大多数人就是要最新，不该让他多操作一步。
+     *   想停在中间版本的才需要动手选。
+     *
+     * @param list 已按 versionCode 从大到小排好，且只含比当前版本新的。
+     */
+    private void showUpdateDialog(final java.util.ArrayList<UpdateInfo> list) {
+        if (list == null || list.isEmpty()) {
+            return;
+        }
+        // 选中的下标。用数组是为了让匿名内部类里也能改（Java 要求 effectively final）。
+        final int[] sel = {0};
+
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (16 * d);
+
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.setPadding(pad, (int) (6 * d), pad, pad);
+
+        // ---- 版本选择列表 ----
+        final int rowH = (int) (38 * d);
+        final int lineH = (int) (1 * d);
+
+        /*
+          【为什么要这些视觉引导】
+            光是几行灰白文字，看不出它是能点的列表 ——
+            用户会以为那只是更新的标题装饰。
+            所以四样东西一起上：
+              一句话说明  -> 告诉用户"这里可以点"
+              外框        -> 划出边界，看得出是个列表容器
+              常驻滚动条  -> 看得出内容超出、还能往下滑
+              选中勾 + 最新标签 -> 看得出当前选的是哪个、哪个最新
+        */
+
+        android.widget.TextView verTip = new android.widget.TextView(this);
+        verTip.setText(list.size() > 1
+                ? "点击选择要安装的版本（可上下滑动）"
+                : "点击选择要安装的版本");
+        verTip.setTextSize(12f);
+        verTip.setTextColor(0xFF888888);
+        verTip.setPadding((int) (2 * d), 0, 0, (int) (4 * d));
+        root.addView(verTip);
+
+        // 外框：浅灰底 + 1dp 边线，把列表框出来
+        android.widget.LinearLayout verFrame =
+                new android.widget.LinearLayout(this);
+        android.graphics.drawable.GradientDrawable vbd =
+                new android.graphics.drawable.GradientDrawable();
+        vbd.setColor(0xFFFAFAFA);
+        vbd.setStroke(lineH, 0xFFCCCCCC);
+        vbd.setCornerRadius((int) (2 * d));
+        verFrame.setBackground(vbd);
+        verFrame.setPadding(lineH, lineH, lineH, lineH);
+
+        android.widget.ScrollView svVer = new android.widget.ScrollView(this);
+        svVer.setVerticalScrollBarEnabled(true);
+        svVer.setScrollbarFadingEnabled(false);   // 滚动条常驻，别淡出
+        final android.widget.LinearLayout verBox =
+                new android.widget.LinearLayout(this);
+        verBox.setOrientation(android.widget.LinearLayout.VERTICAL);
+
+        final java.util.ArrayList<android.widget.LinearLayout> verRows =
+                new java.util.ArrayList<android.widget.LinearLayout>();
+
+        // 选中态刷新：行的底色 + 勾 + 说明文字 + 来源，一起跟着 sel 变。
+        // 【为什么用数组装 Runnable】
+        //   行创建时要往 onClick 里塞它，而 Java 要求被引用的局部变量
+        //   在**使用点之前**就已声明 —— 所以先声明、后赋值。
+        final Runnable[] ref = new Runnable[1];
+
+        for (int i = 0; i < list.size(); i++) {
+            final int idx = i;
+            // 行间分隔线，看得出一行一行的
+            if (i > 0) {
+                android.view.View line = new android.view.View(this);
+                line.setBackgroundColor(0xFFE0E0E0);
+                verBox.addView(line,
+                        new android.widget.LinearLayout.LayoutParams(
+                                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                                lineH));
+            }
+
+            android.widget.LinearLayout row =
+                    new android.widget.LinearLayout(this);
+            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            row.setPadding((int) (10 * d), 0, (int) (10 * d), 0);
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (sel[0] == idx) {
+                        return;
+                    }
+                    sel[0] = idx;
+                    if (ref[0] != null) {
+                        ref[0].run();
+                    }
+                }
+            });
+
+            // 勾：固定宽度占位，选中才显示 —— 宽度固定，文字不会左右跳
+            android.widget.TextView mk = new android.widget.TextView(this);
+            mk.setTextSize(13f);
+            mk.setGravity(android.view.Gravity.CENTER);
+            row.addView(mk, new android.widget.LinearLayout.LayoutParams(
+                    (int) (18 * d),
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT));
+
+            android.widget.TextView nm = new android.widget.TextView(this);
+            nm.setText(list.get(i).name);
+            nm.setTextSize(13f);
+            nm.setSingleLine(true);
+            row.addView(nm, new android.widget.LinearLayout.LayoutParams(
+                    0,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+            // 最新的那个标一下，让人知道哪个是最新
+            android.widget.TextView tg = new android.widget.TextView(this);
+            tg.setText(i == 0 ? "最新" : "");
+            tg.setTextSize(11f);
+            tg.setTextColor(0xFF1A73E8);
+            row.addView(tg, new android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            verRows.add(row);
+            verBox.addView(row, new android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT, rowH));
+        }
+        svVer.addView(verBox);
+        verFrame.addView(svVer);
+        // 只有一项时不滚动，也别占两行的高度（+lineH 是两行之间那条分隔线）
+        int verH = (list.size() > 1) ? rowH * 2 + lineH : rowH;
+        root.addView(verFrame, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT, verH));
+
+        // ---- 更新说明（跟着选中的版本变）----
+        final int maxH = (int) (getResources().getDisplayMetrics().heightPixels * 0.50);
+        android.widget.ScrollView sv = new android.widget.ScrollView(this) {
+            @Override
+            protected void onMeasure(int wms, int hms) {
+                super.onMeasure(wms,
+                        android.view.View.MeasureSpec.makeMeasureSpec(
+                                maxH, android.view.View.MeasureSpec.AT_MOST));
+            }
+        };
+        final android.widget.TextView tv = new android.widget.TextView(this);
+        tv.setTextSize(13f);
+        tv.setTextColor(0xFF333333);
+        tv.setPadding(0, (int) (8 * d), 0, 0);
+        sv.addView(tv);
+        root.addView(sv, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        ref[0] = new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < verRows.size(); i++) {
+                    boolean on = (i == sel[0]);
+                    android.widget.LinearLayout r = verRows.get(i);
+                    r.setBackgroundColor(on ? 0xFFE3F0FF : 0x00000000);
+                    android.widget.TextView mk = (android.widget.TextView) r.getChildAt(0);
+                    android.widget.TextView nm = (android.widget.TextView) r.getChildAt(1);
+                    mk.setText(on ? "\u2713" : "");
+                    mk.setTextColor(0xFF1A73E8);
+                    nm.setTextColor(on ? 0xFF1A73E8 : 0xFF555555);
+                    nm.getPaint().setFakeBoldText(on);
+                }
+                UpdateInfo cur = list.get(sel[0]);
+                StringBuilder sb = new StringBuilder();
+                sb.append("新版本：").append(cur.name).append("\n\n");
+                if (cur.changelog.length() > 0) {
+                    sb.append(cur.changelog).append("\n\n");
+                }
+                sb.append("来源：").append(hostOf(cur.from));
+                tv.setText(sb.toString());
+            }
+        };
+
+        // ---- 按钮行：三个下载靠左，spacer 撑开，「以后再说」顶到最右 ----
+        android.widget.LinearLayout btns = new android.widget.LinearLayout(this);
+        btns.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        btns.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        btns.setPadding(0, (int) (10 * d), 0, 0);
+
+        // 下载目标跟着选中的版本走 —— 选了中间版本就下中间版本
+        addDlButton(btns, "123网盘", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                UpdateInfo cur = list.get(sel[0]);
+                openUrl(cur.netdiskUrl.length() > 0 ? cur.netdiskUrl : URL_NETDISK);
+            }
+        });
+        addDlButton(btns, "GitHub 仓库", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                UpdateInfo cur = list.get(sel[0]);
+                openUrl(cur.htmlUrl.length() > 0 ? cur.htmlUrl : URL_RELEASES);
+            }
+        });
+        addDlButton(btns, "GitHub 直链", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                UpdateInfo cur = list.get(sel[0]);
+                startDownload(cur.apkUrl, cur.name);
+            }
+        });
+
+        android.view.View spacer = new android.view.View(this);
+        btns.addView(spacer,
+                new android.widget.LinearLayout.LayoutParams(0, 0, 1f));
+
+        final android.widget.Button later = new android.widget.Button(this);
+        later.setText("以后再说");
+        later.setTextSize(11f);
+        later.setAllCaps(false);
+        later.setBackgroundColor(0x00000000);
+        later.setTextColor(0xFF555555);
+        later.setMinWidth(0);
+        later.setMinimumWidth(0);
+        later.setSingleLine(false);
+        later.setMaxLines(2);
+        later.setEllipsize(null);
+        int lh = (int) (5 * d);
+        int lhp = (int) (4 * d);
+        later.setPadding(lhp, lh, lhp, lh);
+        btns.addView(later);
+
+        root.addView(btns, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+                .setTitle("发现新版本")
+                .setView(root)
+                .show();
+        later.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                dlg.dismiss();
+            }
+        });
+        ref[0].run();   // 初次渲染：默认选中最新的那个
     }
 
     private void showUpdateDialog(final UpdateInfo info) {
@@ -3328,7 +3725,18 @@ public class MainActivity extends Activity {
         updateAgreeButton(seen);
     }
 
-    /** 设置：目前就一个自动检查更新的开关。 */
+    private boolean mousePreviewEnabled() {
+        return getSharedPreferences(PREF_SET, MODE_PRIVATE)
+                .getBoolean(GamepadView.PREF_MOUSE_PREVIEW,
+                        GamepadView.MOUSE_PREVIEW_DEFAULT);
+    }
+
+    private void setMousePreview(boolean on) {
+        getSharedPreferences(PREF_SET, MODE_PRIVATE).edit()
+                .putBoolean(GamepadView.PREF_MOUSE_PREVIEW, on).apply();
+    }
+
+    /** 设置：自动检查更新 + 触摸板落点预览。 */
     private void showSettingsDialog() {
         android.widget.LinearLayout box = new android.widget.LinearLayout(this);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
@@ -3350,6 +3758,28 @@ public class MainActivity extends Activity {
         tip.setTextColor(0xFF666666);
         box.addView(tip);
 
+        android.view.View div = new android.view.View(this);
+        div.setBackgroundColor(0xFFDDDDDD);
+        box.addView(div, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                (int) (1 * d)));
+
+        final android.widget.CheckBox cbPrev = new android.widget.CheckBox(this);
+        cbPrev.setText("触摸板拖动时显示落点预览");
+        cbPrev.setChecked(mousePreviewEnabled());
+        cbPrev.setTextSize(14f);
+        box.addView(cbPrev);
+
+        android.widget.TextView tip2 = new android.widget.TextView(this);
+        tip2.setText("开启后，在触摸板上拖动会画出「从按下的位置到松手后会落到哪」"
+                + "的点和连线，方便预判光标会走多远。"
+                + "\n默认是关的 —— 松手模式下光标本身就要等抬手才动，"
+                + "画一条线反而容易被当成卡住了。"
+                + "\n只影响显示，不影响鼠标能不能用。");
+        tip2.setTextSize(11f);
+        tip2.setTextColor(0xFF666666);
+        box.addView(tip2);
+
         new android.app.AlertDialog.Builder(this)
                 .setTitle("设置")
                 .setView(box)
@@ -3358,6 +3788,7 @@ public class MainActivity extends Activity {
                             @Override
                             public void onClick(android.content.DialogInterface dlg, int w) {
                                 setAutoUpdate(cb.isChecked());
+                                setMousePreview(cbPrev.isChecked());
                                 toast(cb.isChecked() ? "已开启自动检查更新"
                                         : "已关闭自动检查更新");
                             }
