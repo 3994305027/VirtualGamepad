@@ -89,6 +89,21 @@ abstract class PickList extends View {
          */
         void onKey(int usage, boolean pressed);
 
+        /**
+         * 鼠标相对移动（触摸板拖动）。
+         *
+         * 和 onAxis 的区别：onAxis 是"当前推到 -1..1 的哪个位置"（状态，
+         * 丢一帧下一帧补回来）；这里是"这一下往右走了几格"（增量，
+         * 丢了就永久少走一段）。
+         */
+        void onMouseMove(int dx, int dy);
+
+        /** 鼠标按键：0=左 1=右 2=中。 */
+        void onMouseButton(int btn, boolean pressed);
+
+        /** 鼠标滚轮：正 = 向上滚，负 = 向下。一次一格。 */
+        void onMouseWheel(int notches);
+
         /** 用户点了「收」 */
         void onCollapse();
 
@@ -344,7 +359,13 @@ abstract class PickList extends View {
     static final int LIST_FIX = 18;
     static final int LIST_RESET_DIM = 19;
     static final int LIST_CREATE = 20;
-    static final String[] CREATE_NAMES = {"手柄按键", "键盘按键", "空白", "组合键"};
+    static final int LIST_MOUSE = 22;
+    /** 鼠标元素候选表：触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下 */
+    static final int[] MOUSE_CANDIDATES = {
+            PadLayout.I_MOUSE_PAD, PadLayout.I_MOUSE_L, PadLayout.I_MOUSE_R,
+            PadLayout.I_MOUSE_M, PadLayout.I_MOUSE_WU, PadLayout.I_MOUSE_WD,
+    };
+    static final String[] CREATE_NAMES = {"手柄按键", "键盘按键", "空白", "组合键", "鼠标键"};
     static final int LIST_SYNC_PICK = 27;
     static final int LIST_SYNC_DIM = 28;
     static final int LIST_SYNC_DIR = 29;
@@ -355,6 +376,7 @@ abstract class PickList extends View {
     static final int CT_PAD = 0;
     static final int CT_BLANK = 2;
     static final int CT_COMBO = 3;
+    static final int CT_MOUSE = 4;
     static final int LIST_MORE = 21;
     static final int LIST_APPEAR = 39;
     static final int LIST_COMBO_EDIT = 24;
@@ -523,6 +545,7 @@ abstract class PickList extends View {
     abstract void fixCycle(int tpl, int code);
     abstract void exitEditMode();
     abstract void createPad(int pos);
+    abstract void createMouse(int pos);
     abstract void comboToggleEndAfter(int pos);
     abstract boolean comboRowNoAutoIndex(int pos);
     abstract String comboRowName(int pos);
@@ -971,6 +994,14 @@ abstract class PickList extends View {
             if (!delOnly && PadLayout.isBlankSlot(i) && !base.isBlankUsed(i)) {
                 continue;
             }
+            // 【鼠标六个槽位同理】
+            //   它们是固定槽位，"默认鼠标"布局之外 padType 全是 0、
+            //   名字也是空的 —— 不过滤的话，任何按钮列表里都会凭空
+            //   多出 6 行没有名字的空项，还能勾选、还能点。
+            //   和键盘 / 空白 / 组合键槽位用同一套判据。
+            if (!delOnly && PadLayout.isMouseSlot(i) && !base.isMouseUsed(i)) {
+                continue;
+            }
             // 【悬浮窗布局里「收」不进任何按钮列表】
             //   这个布局里它是被 G 顶掉的：不画、也点不中（见 pickable）。
             //   列表里还留着一行就等于有个"选了也没用"的项 ——
@@ -1096,6 +1127,8 @@ abstract class PickList extends View {
                         mLayout.removeBlank(mDlgTargetId);
                     } else if (PadLayout.isComboSlot(mDlgTargetId)) {
                         mLayout.removeCombo(mDlgTargetId);
+                    } else if (PadLayout.isMouseSlot(mDlgTargetId)) {
+                        mLayout.removeMouse(mDlgTargetId);
                     } else {
                         mLayout.removePad(mDlgTargetId);
                     }
@@ -1708,6 +1741,9 @@ abstract class PickList extends View {
                 break;
             case LIST_CREATE:
                 title = "按键创建：选类型";
+                break;
+            case LIST_MOUSE:
+                title = "鼠标键：选一个";
                 break;
             case LIST_MORE:
                 title = "更多选项";
@@ -3625,6 +3661,9 @@ abstract class PickList extends View {
         if (mListMode == LIST_CREATE) {
             return CREATE_NAMES.length;
         }
+        if (mListMode == LIST_MOUSE) {
+            return MOUSE_CANDIDATES.length;
+        }
         if (mListMode == LIST_MORE) {
             return moreRowNames().length;
         }
@@ -3734,6 +3773,10 @@ abstract class PickList extends View {
         }
         if (mListMode == LIST_CREATE) {
             return (pos >= 0 && pos < CREATE_NAMES.length) ? CREATE_NAMES[pos] : "";
+        }
+        if (mListMode == LIST_MOUSE) {
+            return (pos >= 0 && pos < MOUSE_CANDIDATES.length)
+                    ? PadLayout.mouseNameOf(MOUSE_CANDIDATES[pos]) : "";
         }
         if (mListMode == LIST_MORE) {
             String[] mn = moreRowNames();
@@ -4424,6 +4467,8 @@ abstract class PickList extends View {
         if (PadLayout.isBlankSlot(i) && !mLayout.isBlankUsed(i)) return false;
         // 没建的组合键槽位 = 不存在，同上
         if (PadLayout.isComboSlot(i) && !mLayout.isComboUsed(i)) return false;
+        // 鼠标三件套：只在鼠标布局里启用（padType 由 resetMouse 设上）
+        if (PadLayout.isMouseSlot(i) && !mLayout.isMouseUsed(i)) return false;
         // 【G 和「收」各自只在自己那个布局里可点】
         //   和 shouldDraw() 同一套判据：不画就不能点，
         //   否则会选中一个看不见的东西，拖了也不知道在拖谁。
@@ -4658,8 +4703,13 @@ abstract class PickList extends View {
         if (PadLayout.isBlankSlot(mSel)) {
             return mLayout.isBlankUsed(mSel);
         }
+        // 没建的组合键槽位 = 不存在，同上
         if (PadLayout.isComboSlot(mSel)) {
             return mLayout.isComboUsed(mSel);
+        }
+        // 鼠标元素：建出来之后就能删（触摸板 / 左键 / 中键 / 滚轮都算）
+        if (PadLayout.isMouseSlot(mSel)) {
+            return mLayout.isMouseUsed(mSel);
         }
         return mLayout.isPadUsed(mSel) && !PadLayout.isUiButton(mSel);
     }
@@ -4743,6 +4793,10 @@ abstract class PickList extends View {
             createPad(pos);
             return;
         }
+        if (mListMode == LIST_MOUSE) {
+            createMouse(pos);
+            return;
+        }
         if (mListMode == LIST_CREATE) {
             // 只分流，不创建：选完进对应的候选表，在那儿才是"点一个就建"
             if (pos == CT_BLANK) {
@@ -4752,6 +4806,11 @@ abstract class PickList extends View {
             if (pos == CT_COMBO) {
                 // 先问做成"按钮"还是"十字架"
                 openListBack(LIST_COMBO_KIND, LIST_CREATE);
+                return;
+            }
+            if (pos == CT_MOUSE) {
+                // 鼠标元素有自己的候选表：六个固定种类，别混进手柄按键表
+                openListBack(LIST_MOUSE, LIST_CREATE);
                 return;
             }
             // 候选表是从「按键创建」进来的，返回退回按键创建

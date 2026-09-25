@@ -253,8 +253,70 @@ public final class PadLayout {
      */
     public static final int I_FLOAT = COMBO_START + MAX_COMBO;
 
-    /** 数组总长：固定元素 + 键盘槽位 + 布局按钮 + 副本槽位 + 穿透 + 空白 + 组合键 + G */
-    public static final int N = I_FLOAT + 1;
+    /*
+      鼠标布局的三个元素。同样放末尾，理由同上：
+      摆位存档用下标当 key，放末尾则 0..I_FLOAT 一个不动，老存档直接兼容。
+
+      它们不是"手柄按键" —— I_MOUSE_PAD 是拖动区（发相对位移），
+      左右键发的是鼠标设备的按键位，都不走 GamepadReport。
+      所以不放进 N_FIXED，也不进副本区，单独占末尾三个槽位。
+    */
+    public static final int I_MOUSE_PAD = I_FLOAT + 1;
+
+    /**
+     * 触摸板默认透明度。
+     *
+     * 触摸板是块大面积矩形，铺在下半屏会挡住游戏画面，
+     * 所以它比别的按键默认淡一半 —— 看得见边界、又不挡视线。
+     * 想更淡/更实去「选中 → 属性 → 透明度」调，跟别的一样。
+     */
+    public static final float MOUSE_PAD_ALPHA = 0.5f;
+    public static final int I_MOUSE_L = I_FLOAT + 2;
+    public static final int I_MOUSE_R = I_FLOAT + 3;
+    public static final int I_MOUSE_M = I_FLOAT + 4;
+    public static final int I_MOUSE_WU = I_FLOAT + 5;
+    public static final int I_MOUSE_WD = I_FLOAT + 6;
+
+    /** 数组总长：... + G + 鼠标六个 */
+    public static final int N = I_MOUSE_WD + 1;
+
+    /** 鼠标元素槽位：触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下 */
+    public static boolean isMouseSlot(int i) {
+        return i >= I_MOUSE_PAD && i <= I_MOUSE_WD;
+    }
+
+    /** 鼠标元素的默认名字，创建 / 删除时用。 */
+    public static String mouseNameOf(int i) {
+        if (i == I_MOUSE_PAD) return "触摸板";
+        if (i == I_MOUSE_L) return "左键";
+        if (i == I_MOUSE_R) return "右键";
+        if (i == I_MOUSE_M) return "中键";
+        if (i == I_MOUSE_WU) return "滚轮上";
+        if (i == I_MOUSE_WD) return "滚轮下";
+        return "";
+    }
+
+    /** 这个鼠标槽位是不是空的（可以往里建一个）。 */
+    public int allocMouseSlot() {
+        for (int i = I_MOUSE_PAD; i <= I_MOUSE_WD; i++) {
+            if (padType[i] == 0) return i;
+        }
+        return -1;
+    }
+
+    /** 鼠标元素还剩几个空位。 */
+    public int mouseFreeCount() {
+        int n = 0;
+        for (int i = I_MOUSE_PAD; i <= I_MOUSE_WD; i++) {
+            if (padType[i] == 0) n++;
+        }
+        return n;
+    }
+
+    /** 这个鼠标元素当前是否启用（模板决定，不可增删）。 */
+    public boolean isMouseUsed(int i) {
+        return isMouseSlot(i) && padType[i] != 0;
+    }
 
     // ---- 存档迁移（下标位移）----
     //
@@ -400,6 +462,24 @@ public final class PadLayout {
     private static final int LAYOUT_VERSION_KEY_P = 8;
     private static final int LAYOUT_VERSION_KEY_L = 8;
 
+    /**
+     * 「默认鼠标」布局自己的版本号。
+     *
+     * 【为什么要单独开一个】
+     *   LAYOUT_DEFAULT_MOUSE = 30，而 LAYOUT_USER_START = 2 ——
+     *   30 >= 2，于是 versionFor() 把它判成"用户布局"，
+     *   返回 USER_LAYOUT_VERSION，而那个常量是**永不递增**的。
+     *
+     *   后果很隐蔽：改了 resetMouse()（中键竖排 / 触摸板形状 /
+     *   透明度 50%），代码里全都对，但用户第一次进「默认鼠标」存下的
+     *   那份存档版本号永远对得上，读的一直是旧布局 ——
+     *   界面上看到的还是改之前的形状（形状栏里就是那个 长3.87 宽2.30）。
+     *
+     *   现在鼠标布局走自己的版本号，以后改 resetMouse 就 +1。
+     */
+    private static final int LAYOUT_VERSION_MOUSE_P = 6;
+    private static final int LAYOUT_VERSION_MOUSE_L = 6;
+
     /** 当前是键盘模式（true）还是手柄模式（false）。 */
     public boolean keyboardMode;
 
@@ -487,6 +567,18 @@ public final class PadLayout {
         return i == I_LS || i == I_RS;
     }
 
+        /**
+     * 【默认鼠标】触摸板的形状倍率。
+     *
+     * 「形状」面板里那个「长」就是 widthMul、「宽」就是 heightMul，
+     * 所以这两个值直接决定了形状栏里显示的数字：长3.87 宽2.30。
+     *
+     * 比例 3.87 : 2.30 ≈ 1.68 : 1 —— 比 2:1 稍"矮胖"一点，
+     * 竖屏下半屏摆着刚好，不会顶到左右键那一排。
+     */
+    public static final float MOUSE_PAD_W_MUL = 3.87f;
+    public static final float MOUSE_PAD_H_MUL = 2.30f;
+
     public static final float MIN_SIZE_MUL = 0.08f;
     public static final float MAX_SIZE_MUL = 10f;
 
@@ -573,12 +665,20 @@ public final class PadLayout {
      *   用户布局从 2 递增，nextLayoutId 会跳过这一号。
      */
     public static final int LAYOUT_FLOAT = 31;
+    /**
+     * 「默认鼠标」布局：触摸板 + 左键 + 右键。
+     *
+     * 取 30 而不是 3：用户布局从 2 递增，取 3 迟早会撞上，
+     * 取一个远在用户号段之外的大号就没这个冲突（nextLayoutId 会跳过内置号）。
+     */
+    public static final int LAYOUT_DEFAULT_MOUSE = 30;
     public static final int LAYOUT_MAX = 40;
 
     /** 新建布局时的三种模板。 */
     public static final int TPL_BLANK = 0;      // 空白：只有界面按钮，没有游戏键
     public static final int TPL_PAD = 1;        // 手柄模板 = 默认手柄那套
     public static final int TPL_KEYBOARD = 2;   // 键盘模板 = 全键盘
+    public static final int TPL_MOUSE = 3;      // 鼠标模板 = 触摸板 + 左键 + 右键
 
     /**
      * 用户布局的版本号。
@@ -722,6 +822,12 @@ public final class PadLayout {
     }
 
     private static int versionFor(boolean portrait, int layoutId, boolean keyboard) {
+        // 鼠标布局必须排在"用户布局"判断**前面**：
+        // 它的 id=30 也 >= LAYOUT_USER_START，会被误判成用户布局，
+        // 从而拿到永不递增的版本号，改了默认布局也不生效。
+        if (layoutId == LAYOUT_DEFAULT_MOUSE) {
+            return portrait ? LAYOUT_VERSION_MOUSE_P : LAYOUT_VERSION_MOUSE_L;
+        }
         if (layoutId >= LAYOUT_USER_START) {
             return USER_LAYOUT_VERSION;
         }
@@ -1864,6 +1970,27 @@ public final class PadLayout {
         //   用户会以为功能坏了。想要它不显示，手动在「隐藏按钮」里关掉即可，
         //   那个设置是存盘的，不会被重置冲掉。
         hidden[I_LAYOUT] = false;
+        /*
+          鼠标模板。
+          先走 resetBlank 清出一块干净的画布（手柄键 / 键盘键全删），
+          再摆上触摸板 + 左键 + 右键三个元素。
+
+          鼠标元素走的是第三个 uhid 设备（MouseReport），和手柄那份报告
+          没有任何关系，所以放进手柄按键的候选表里是不合适的 —— 那里
+          每一项都对应 GamepadReport 的某个按钮/轴。
+          它们有自己的候选表（创建 → 鼠标键），六个固定种类：
+          触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下，
+          每种最多一个，可删、删了还能再建回来。
+        */
+        if (tpl == TPL_MOUSE) {
+            resetBlank(w, h, portrait, bottomLimit, topLimit);
+            resetMouse(w, h, portrait);
+            applyFixedInit(ctx, tpl, "pad");
+            applyFixedInit(ctx, tpl, "key");
+            floatBallStyle(this);
+            applyFloatVisibility(this);
+            return;
+        }
         if (tpl == TPL_BLANK) {
             resetBlank(w, h, portrait, bottomLimit, topLimit);
             // 空白模板没有现成的键可隐藏 / 删除，只有"添加"有意义。
@@ -2435,6 +2562,130 @@ public final class PadLayout {
     }
 
     /**
+     * 摆鼠标布局的三个元素：触摸板（大矩形）+ 左键 + 右键。
+     *
+     * 【位置：为什么触摸板在下半屏、左右键在上】
+     *   和笔记本一致 —— 拇指在下方拖触摸板，食指在上方点左右键。
+     *   悬浮窗通常贴着屏幕边，上半部分留给游戏画面。
+     *
+     * 【halfW / halfH 由 radius × 倍率算出】
+     *   矩形没有独立的宽高字段，只能靠 mRadius × widthMul / heightMul。
+     *   所以先定想要的半宽半高，再反解出倍率，别直接写倍率的数
+     *   —— 那样横竖屏比例一变就变形。
+     */
+    private void resetMouse(int w, int h, boolean portrait) {
+        // ---- 触摸板 ----
+        padType[I_MOUSE_PAD] = typeOfElem(I_MOUSE_PAD);
+        hidden[I_MOUSE_PAD] = false;
+        shape[I_MOUSE_PAD] = SHAPE_RECT;
+        // 长方形：形状倍率定死成 长3.87 宽2.30（比例约 1.68:1）。
+        //
+        // 不再各自按 w、h 取比例 —— 那样窄屏上算出来接近正方形，
+        // 看着是个大方块，而且形状栏里的数字随屏幕变，对不上。
+        //
+        // 反过来推半径：先按屏宽定一个期望半宽，半径 = 半宽 / 3.87；
+        // 再算出的半高若超过屏幕能给的，就按半高反推半径。
+        float wantHW = w * (portrait ? 0.42f : 0.32f);
+        float maxHH = h * (portrait ? 0.12f : 0.20f);
+        float padR = wantHW / MOUSE_PAD_W_MUL;
+        if (padR * MOUSE_PAD_H_MUL > maxHH) {
+            padR = maxHH / MOUSE_PAD_H_MUL;
+        }
+        mRadius[I_MOUSE_PAD] = padR;
+        widthMul[I_MOUSE_PAD] = MOUSE_PAD_W_MUL;
+        heightMul[I_MOUSE_PAD] = MOUSE_PAD_H_MUL;
+        rx[I_MOUSE_PAD] = 0.5f;
+        ry[I_MOUSE_PAD] = portrait ? 0.66f : 0.62f;
+        customName[I_MOUSE_PAD] = "触摸板";
+        showLabel[I_MOUSE_PAD] = true;
+        alpha[I_MOUSE_PAD] = MOUSE_PAD_ALPHA;
+
+        // ---- 左键 / 右键 ----
+        float btnR = Math.min(w, h) * 0.075f;
+        int[] btns = {I_MOUSE_L, I_MOUSE_R};
+        float[] bx = {0.26f, 0.74f};
+        String[] bn = {"左键", "右键"};
+        for (int k = 0; k < btns.length; k++) {
+            int i = btns[k];
+            padType[i] = typeOfElem(i);
+            hidden[i] = false;
+            shape[i] = SHAPE_CIRCLE;
+            mRadius[i] = btnR;
+            widthMul[i] = 1f;
+            heightMul[i] = 1f;
+            rx[i] = bx[k];
+            ry[i] = portrait ? 0.34f : 0.36f;
+            customName[i] = bn[k];
+            showLabel[i] = true;
+        }
+
+        // ---- 中键 / 滚轮上 / 滚轮下 ----
+        // 排在左右键下面一行，中键居中，两个滚轮分列两侧。
+        // 竖着排一列：滚轮上 / 中键 / 滚轮下。
+        // 中键那一行和左右键齐平（ry 与左右键相同），滚轮分列它上下 ——
+        // 滚一下、按一下的动线是竖直的，横排会误触。
+        int[] extra = {I_MOUSE_WU, I_MOUSE_M, I_MOUSE_WD};
+        String[] en = {"滚轮上", "中键", "滚轮下"};
+        float[] eyP = {0.24f, 0.34f, 0.44f};
+        float[] eyL = {0.26f, 0.38f, 0.50f};
+        for (int k = 0; k < extra.length; k++) {
+            int i = extra[k];
+            padType[i] = typeOfElem(i);
+            hidden[i] = false;
+            shape[i] = SHAPE_CIRCLE;
+            mRadius[i] = btnR * 0.8f;
+            widthMul[i] = 1f;
+            heightMul[i] = 1f;
+            rx[i] = 0.5f;
+            ry[i] = portrait ? eyP[k] : eyL[k];
+            customName[i] = en[k];
+            showLabel[i] = true;
+        }
+    }
+
+    /**
+     * 往一个空的鼠标槽位里建一个元素。
+     *
+     * 六个槽位（触摸板/左/右/中/滚轮上/滚轮下）是固定的，
+     * 建的时候找第一个空的填进去 —— 所以同一个种类只能有一个，
+     * 建过了再建会返回 -1，提示先删。
+     */
+    public int addMouse(int which, float r) {
+        int i = allocMouseSlot();
+        if (i < 0) return -1;
+        resetMouseSlot(i, which);
+        if (r > 0) mRadius[i] = r;
+        return i;
+    }
+
+    /** 把某个鼠标槽位填成指定种类（建 / 模板重置都走这里）。 */
+    public void resetMouseSlot(int i, int which) {
+        if (!isMouseSlot(i)) return;
+        if (which < I_MOUSE_PAD || which > I_MOUSE_WD) return;
+        padType[i] = typeOfElem(which);
+        hidden[i] = false;
+        shape[i] = (which == I_MOUSE_PAD) ? SHAPE_RECT : SHAPE_CIRCLE;
+        scale[i] = 1f;
+        alpha[i] = (which == I_MOUSE_PAD) ? MOUSE_PAD_ALPHA : 1f;
+        textScale[i] = 1f;
+        widthMul[i] = 1f;
+        heightMul[i] = 1f;
+        if (which == I_MOUSE_PAD) {
+            widthMul[i] = 1.6f;
+            heightMul[i] = 0.7f;
+        }
+        showLabel[i] = true;
+        customName[i] = mouseNameOf(which);
+    }
+
+    /** 删掉一个鼠标元素，槽位回收（padType 归 0）。 */
+    public void removeMouse(int i) {
+        if (!isMouseSlot(i)) return;
+        padType[i] = 0;
+        hidden[i] = false;
+    }
+
+    /**
      * 摆「编」「收」「模式」三个界面按钮。
      * 编/模式在左上，收在右上，间距 2×按钮半径保证不重叠。
      * 「布」的默认可见性规则：
@@ -2733,13 +2984,15 @@ public final class PadLayout {
         }
         boolean keyboard = meta != null && meta.tpl == TPL_KEYBOARD;
         boolean blank = meta != null && meta.tpl == TPL_BLANK;
+        boolean mouse = meta != null && meta.tpl == TPL_MOUSE;
         PadLayout l = new PadLayout();
         l.layoutId = layoutId;
         l.layoutName = meta != null ? meta.name : "";
         // 传 ctx：末尾会套用「固定显示」里存的初始状态覆盖。
         // 新建布局（还没写过摆位存档）走的正是这条路。
         l.reset(w, h, portrait, bottomLimit, topLimit,
-                keyboard ? TPL_KEYBOARD : (blank ? TPL_BLANK : TPL_PAD), ctx);
+                keyboard ? TPL_KEYBOARD
+                        : (blank ? TPL_BLANK : (mouse ? TPL_MOUSE : TPL_PAD)), ctx);
         try {
             SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
             String s = p.getString(variantKey(portrait, layoutId, keyboard), null);
@@ -3493,6 +3746,7 @@ public final class PadLayout {
         // 悬浮窗布局：内置，所以布局列表里不显示「删 / 改名 / 同步」，
         // 唯一能做的就是点一下切过去。
         out.add(new LayoutMeta(LAYOUT_FLOAT, "悬浮窗", TPL_BLANK, true));
+        out.add(new LayoutMeta(LAYOUT_DEFAULT_MOUSE, "默认鼠标", TPL_MOUSE, true));
         try {
             SharedPreferences p = ctx.getSharedPreferences(PREFS_LAYOUTS, Context.MODE_PRIVATE);
             String s = p.getString(KEY_LIST, null);

@@ -314,6 +314,31 @@ public class SocketLink {
         send("k " + usage + " " + (pressed ? "1" : "0"));
     }
 
+    /**
+     * 鼠标相对移动。
+     *
+     * 【为什么是 int 而不是 float】
+     *   MouseReport 里位移是 int8（-127..127），传小数没有意义。
+     *   而且这里是增量：发一条就走一段，丢一条就少走一段，
+     *   和 axis() 那种"当前位置"的语义完全不同，别混用。
+     */
+    public void mouseMove(int dx, int dy) {
+        send("m " + dx + " " + dy);
+    }
+
+    /** 鼠标按键：0=左 1=右 2=中 3/4=侧键。 */
+    public void mouseButton(int btn, boolean pressed) {
+        send("c " + btn + " " + (pressed ? "1" : "0"));
+    }
+
+    /**
+     * 鼠标滚轮。复用 m 命令的第三个参数：
+     * daemon 那边 "m dx dy wheel"，传 0 位移只带滚轮就是纯滚动。
+     */
+    public void mouseWheel(int notches) {
+        send("m 0 0 " + notches);
+    }
+
     public void reset() {
         send("r");
     }

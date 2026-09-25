@@ -52,6 +52,8 @@ public class GpadDaemon {
      *       这是唯一一个"会改变键盘设备能力"的版本：6 键上限没了，
      *       换成一位一键，理论上可全键无冲。
      *       手柄那份描述符仍然一个字节没动。
+     *   6 = 新增**第三个 uhid 设备**（虚拟鼠标）+ m / c 命令。
+     *       手柄和键盘两份描述符仍然一个字节都没动。
      *
      *   【为什么必须升版本 + 必须重启守护进程】
      *     描述符是建 /dev/uhid 设备时一次性注册的，改了不重启就是旧布局。
@@ -59,7 +61,7 @@ public class GpadDaemon {
      *     旧进程收到新 app 的 usage 会照旧往 6 格里塞，第 7 个键照样丢。
      *     所以版本必须对上，对不上就在界面上橙字提示。
      */
-    public static final int PROTOCOL_VERSION = 5;
+    public static final int PROTOCOL_VERSION = 6;
 
     /**
      * 不能用 Xbox 360 的 045E:028E。
@@ -99,6 +101,8 @@ public class GpadDaemon {
         final KeyboardReport kbdReport = new KeyboardReport(kbdBootMode);
         Device device;
         Device kbdDevice;
+        Device mouseDevice;
+        final MouseReport mouseReport = new MouseReport();
         // 设备名带上协议版本号。
         //
         // 这是唯一不依赖 app 的"我跑的是哪一版"证据：
@@ -167,6 +171,40 @@ public class GpadDaemon {
             return;
         }
 
+        // 第三个 uhid 设备：虚拟鼠标。
+        //
+        // 【同样是单独开一个设备】手柄和键盘那份已验证的描述符一个字节都不动，
+        //   鼠标的按键/轴语义完全不同（相对位移 vs 绝对轴），塞不进同一份报告。
+        //
+        // 【为什么用 mouse 而不是 touch】
+        //   系统靠 BTN_LEFT + REL_X/REL_Y 把它识别成 cursor 设备，
+        //   指针由 system_server 的 PointerController 画 —— 这才是"真鼠标"。
+        final String mouseName = "Virtual Gamepad Mouse v" + PROTOCOL_VERSION;
+        try {
+            mouseDevice = new Device(
+                    3,
+                    mouseName,
+                    "vgamepad-mouse-p" + PROTOCOL_VERSION,
+                    VID, PID, BUS_USB,
+                    MouseReport.DESCRIPTOR,
+                    mouseReport.buffer(),
+                    null,
+                    null);
+        } catch (IOException e) {
+            System.err.println("cannot create uhid mouse: " + e);
+            Log.e(TAG, "cannot create uhid mouse", e);
+            try {
+                device.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                kbdDevice.close();
+            } catch (Exception ignored) {
+            }
+            System.exit(1);
+            return;
+        }
+
         // 关键：把映射版本和布局直接打到终端。
         // 这是唯一不依赖 APK 的验证手段 —— app 里那个版本提示只在"app 是新的"
         // 时才存在，APK 没更新时它根本不会执行，所以必须在这里能亲眼看到。
@@ -185,6 +223,9 @@ public class GpadDaemon {
         System.out.println("==============================================");
         System.out.println("设备 1（手柄）: " + devName);
         System.out.println("设备 2（键盘）: " + kbdName);
+        System.out.println("设备 3（鼠标）: " + mouseName);
+        System.out.println("   报告 " + MouseReport.REPORT_SIZE + " 字节"
+                + "（按键 5 位 + X/Y/Wheel/水平滚轮 各 8 位相对）");
         System.out.println("   键盘报告 " + kbdReport.size() + " 字节"
                 + (kbdBootMode ? "（boot 6KRO：修饰键 + 6 键数组，同时最多 6 键）"
                                : "（NKRO bitmap：修饰键 8 位 + 键位 224 位，无 6 键上限）"));
@@ -209,7 +250,7 @@ public class GpadDaemon {
         // can block on stdin, exactly like the upstream Hid command does.
         // Shizuku/Termux keep the process alive via the stdin pipe; a process
         // that only blocks on accept() gets reaped after about a second.
-        startListener(device, report, kbdDevice, kbdReport);
+        startListener(device, report, kbdDevice, kbdReport, mouseDevice, mouseReport);
 
         // Heartbeat: if the process is still alive you will see this count up.
         startHeartbeat();
@@ -327,7 +368,8 @@ public class GpadDaemon {
     private static volatile int sCmdCount;
 
     private static void startListener(final Device device, final GamepadReport report,
-                                      final Device kbdDevice, final KeyboardReport kbdReport) {
+                                      final Device kbdDevice, final KeyboardReport kbdReport,
+                                      final Device mouseDevice, final MouseReport mouseReport) {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -370,7 +412,8 @@ public class GpadDaemon {
                             @Override
                             public void run() {
                                 try {
-                                    serve(fs, device, report, kbdDevice, kbdReport);
+                                    serve(fs, device, report, kbdDevice, kbdReport,
+                                          mouseDevice, mouseReport);
                                 } catch (Exception e) {
                                     System.out.println("client handler: " + e);
                                 }
@@ -458,7 +501,8 @@ public class GpadDaemon {
     }
 
     private static void serve(Socket socket, Device device, GamepadReport report,
-                              Device kbdDevice, KeyboardReport kbdReport) throws IOException {
+                              Device kbdDevice, KeyboardReport kbdReport,
+                              Device mouseDevice, MouseReport mouseReport) throws IOException {
         BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
         String line;
         try {
@@ -496,6 +540,54 @@ public class GpadDaemon {
                             }
                         } catch (Exception e) {
                             Log.w(TAG, "bad key command: " + line);
+                        }
+                    }
+                    continue;
+                }
+                /*
+                  鼠标命令。和键盘一样单独走，推的是**鼠标设备**的报告。
+
+                  【为什么不合并进手柄那条路径】
+                    鼠标是增量模型：发完一条就得把位移清掉，
+                    否则下一帧会把同一段位移重复计入，光标会一直飘。
+                    而手柄是状态模型，报告里存的是"当前位置"，必须保留。
+                    两者的生命周期相反，不能共用一个 buffer 语义。
+
+                  【命令】
+                    m <dx> <dy>            相对移动（wheel / pan 默认 0）
+                    m <dx> <dy> <wheel>    带垂直滚轮
+                    c <btn> <0|1>          按键：0=左 1=右 2=中 3/4=侧键
+                */
+                if (line.length() > 1 && line.charAt(0) == 'm' && line.charAt(1) == ' ') {
+                    String[] p = line.split(" ");
+                    if (p.length >= 3) {
+                        try {
+                            logCommand(line);
+                            mouseReport.setMove(Integer.parseInt(p[1]),
+                                    Integer.parseInt(p[2]));
+                            mouseReport.setWheel(p.length >= 4
+                                    ? Integer.parseInt(p[3]) : 0);
+                            mouseDevice.sendReport(mouseReport.buffer());
+                            // 位移是一次性的：发完立刻归零。
+                            // 按键状态**不清** —— 按下后不松就一直按着。
+                            mouseReport.clearDelta();
+                        } catch (Exception e) {
+                            Log.w(TAG, "bad mouse command: " + line);
+                        }
+                    }
+                    continue;
+                }
+                if (line.length() > 1 && line.charAt(0) == 'c' && line.charAt(1) == ' ') {
+                    String[] p = line.split(" ");
+                    if (p.length >= 3) {
+                        try {
+                            logCommand(line);
+                            mouseReport.setButton(Integer.parseInt(p[1]),
+                                    p[2].equals("1"));
+                            mouseDevice.sendReport(mouseReport.buffer());
+                            mouseReport.clearDelta();
+                        } catch (Exception e) {
+                            Log.w(TAG, "bad mouse button command: " + line);
                         }
                     }
                     continue;
@@ -548,6 +640,12 @@ public class GpadDaemon {
             kbdReport.reset();
             try {
                 kbdDevice.sendReport(kbdReport.buffer());
+            } catch (IOException ignored) {
+            }
+            // 鼠标同理：按键要松开（位移本来就是一次性的，reset 一并清掉）
+            mouseReport.reset();
+            try {
+                mouseDevice.sendReport(mouseReport.buffer());
             } catch (IOException ignored) {
             }
         }

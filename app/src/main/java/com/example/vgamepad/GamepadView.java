@@ -838,6 +838,99 @@ public class GamepadView extends PickList {
         }
         return NONE;
     }
+    /** 触摸板拖动的上一采样点（像素）。增量模型：发完就挪到当前点。 */
+    private float mMouseLastX;
+    private float mMouseLastY;
+
+    /**
+     * 【本次手势的起点】手指按下那一刻的位置（像素）。
+     *
+     * 预览线从这里发射，而不是从触摸板中心 ——
+     * 手指在触摸板最左边按下，线就以最左边那个点为原点。
+     * 这样"线"和"手指实际划过的那一段"是重合的：
+     * 手指从哪儿开始划，画面上就从哪儿开始长，
+     * 目光不用在"手指"和"板中心"之间来回跳。
+     */
+    private float mMouseOriginX;
+    private float mMouseOriginY;
+
+    /**
+     * 【测试开关】触摸板的两种发送时机。
+     *   false = 边滑边发：每来一个 MOVE 就发一条相对位移
+     *   true  = 松手才发：滑动全程只记账，手指抬起时一次性吐出去
+     *
+     * 它存在的唯一目的是验证一个系统行为：
+     * 只要 App 发出鼠标事件，系统就认为"输入源变了"，
+     * 于是给悬浮窗发 ACTION_CANCEL，当前手势就此终止 ——
+     * 手指还按在屏幕上，但 MOVE 再也不会来，
+     * 表现就是"滑一小段就卡住，得抬手重来"。
+     *
+     * 松手才发时滑动过程中一个鼠标事件都没有。
+     * 如果这样滑动变得顺滑，就证实取消确实是鼠标事件引起的。
+     *
+     * 切换：在触摸板上**双击**（快点两下，别拖动）。
+     */
+    private static boolean sMouseDefer = true;
+
+    /**
+     * 触摸板拖动时要不要画落点预览。
+     *
+     * 由「设置」里的开关控制（默认关）。关掉之后滑动时只走鼠标事件，
+     * 不画那个点 / 箭头 —— 预览本身不影响鼠标功能，纯显示。
+     *
+     * 读的是全局 settings，和 MainActivity 那两个开关同一份文件，
+     * 所以主界面改完、悬浮窗这边立刻生效（SharedPreferences 有内存缓存，
+     * 每次画读一次的开销可以忽略）。
+     */
+    public static final String PREF_MOUSE_PREVIEW = "mouse_pad_preview";
+    public static final boolean MOUSE_PREVIEW_DEFAULT = false;
+
+    static boolean mousePreviewOn(android.content.Context ctx) {
+        if (ctx == null) return MOUSE_PREVIEW_DEFAULT;
+        return ctx.getSharedPreferences("settings", 0)
+                .getBoolean(PREF_MOUSE_PREVIEW, MOUSE_PREVIEW_DEFAULT);
+    }
+
+    /** 松手才发模式下累计的位移（已乘过灵敏度）。 */
+    private float mMouseAccX;
+    private float mMouseAccY;
+
+    /** 本次手势里手指是否真的移动过 —— 用来区分"拖动"和"点两下"。 */
+    private boolean mMouseMoved;
+    /** 上一次轻点触摸板的时间，用来认双击。 */
+    private long mMouseTapMs;
+
+    /**
+     * 鼠标槽位 -> MouseReport 的按键号。
+     * 触摸板不是按键，返回 -1；滚轮也不是按键，同样返回 -1。
+     */
+    private static int mouseButtonOf(int elem) {
+        if (elem == PadLayout.I_MOUSE_L) return MouseReport.BTN_LEFT;
+        if (elem == PadLayout.I_MOUSE_R) return MouseReport.BTN_RIGHT;
+        if (elem == PadLayout.I_MOUSE_M) return MouseReport.BTN_MIDDLE;
+        return -1;
+    }
+
+    /** 滚轮槽位 -> 一次滚几格（正 = 向上）。不是滚轮返回 0。 */
+    private static int mouseWheelOf(int elem) {
+        if (elem == PadLayout.I_MOUSE_WU) return 2;
+        if (elem == PadLayout.I_MOUSE_WD) return -2;
+        return 0;
+    }
+
+    /**
+     * 触摸板灵敏度：手指移动 1px 对应鼠标几格。
+     * 1.0 会觉得太慢（手指要划很长才能穿过屏幕），1.5 是笔记本触摸板的手感。
+     */
+    private static final float MOUSE_SENS = 1.5f;
+
+    /** 位移是 int8，超了会被截断 —— 截断就等于丢一段，光标少走。 */
+    private static int clampDelta(int v) {
+        if (v > 127) return 127;
+        if (v < -127) return -127;
+        return v;
+    }
+
     private final Paint mEditPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mStatusPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mStatusTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -1806,6 +1899,22 @@ public class GamepadView extends PickList {
         if (ui != NONE) {
             return ui;
         }
+        /*
+          鼠标三件套优先判定。
+          它们不在 isPadSlot 范围内，pickable() 里 isPadUsed 会返回 false，
+          后面那几趟循环根本看不到 —— 必须在这里单独判。
+          触摸板是大矩形，用矩形判定而不是圆，否则四个角点不到。
+        */
+        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
+            if (!pickable(i) || !mLayout.isMouseUsed(i)) {
+                continue;
+            }
+            float hw = halfW(i);
+            float hh = halfH(i);
+            if (Math.abs(x - mPx[i]) <= hw && Math.abs(y - mPy[i]) <= hh) {
+                return i;
+            }
+        }
         // 【所有循环都改成"按 proto 遍历全部槽位"】
         //
         // 原来是写死的下标区间：
@@ -2713,6 +2822,21 @@ public class GamepadView extends PickList {
                         onMove(elem, e.getX(i), e.getY(i));
                         used = true;
                     }
+                }
+                /*
+                  【必须重绘】
+                    触摸板的落点预览画的是**手指的累计偏移**，
+                    而这个累计值是在 onMove 里一点点加起来的 ——
+                    加完不重绘的话，画面停留在按下那一帧（那时位移还是 0，
+                    什么都没画），于是"点不跟着手指走"；
+                    只有当别处碰巧触发重绘（比如同时按了别的键）它才闪一下，
+                    看起来就成了"有时显示有时不显示"。
+
+                    编辑模式拖按钮、独立按键窗口 onKeyTouch 那里都有 invalidate，
+                    唯独主窗口的游玩模式 MOVE 漏了。
+                 */
+                if (used) {
+                    invalidate();
                 }
                 return used;
             }
@@ -4171,6 +4295,62 @@ public class GamepadView extends PickList {
     }
 
     /**
+     * 创建一个鼠标元素（触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下）。
+     *
+     * 【和 createPad 的关键区别】
+     *   手柄按键有几十个副本槽位，同一种能建好几个；
+     *   鼠标六个种类各占一个固定槽位，建过了再建就没有位置了 ——
+     *   这时提示先删一个，而不是静默失败。
+     */
+    void createMouse(int pos) {
+        if (pos < 0 || pos >= MOUSE_CANDIDATES.length) {
+            return;
+        }
+        int which = MOUSE_CANDIDATES[pos];
+        // 这个种类已经在布局上了 -> 直接选中它，不重复建
+        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
+            if (mLayout.isMouseUsed(i)
+                    && PadLayout.protoOfType(mLayout.padType[i]) == which) {
+                clearSelection();
+                selectSingle(i);
+                computeGeometry();
+                closeList();
+                if (!mEditMode) {
+                    setEditMode(true, false);
+                }
+                toastLocal(PadLayout.mouseNameOf(which) + " 已经有了");
+                invalidate();
+                return;
+            }
+        }
+        int idx = mLayout.addMouse(which, Math.min(mW, mH) * 0.08f);
+        if (idx < 0) {
+            toastLocal("鼠标元素已达上限（" + MOUSE_CANDIDATES.length
+                    + "个），先删一个再建");
+            closeList();
+            invalidate();
+            return;
+        }
+        // 新建的放到屏幕中间，和 addPad 一致：建完自己拖到想要的位置
+        mLayout.rx[idx] = 0.5f;
+        mLayout.ry[idx] = 0.5f;
+        clearSelection();
+        selectSingle(idx);
+        computeGeometry();
+        mLayout.save(getContext());
+        if (mKeyKeepOpen) {
+            mSel = idx;
+            invalidate();
+        } else {
+            closeList();
+            if (!mEditMode) {
+                setEditMode(true, false);
+            }
+        }
+        invalidate();
+    }
+
+    /**
      * 在屏幕中间创建一个键盘按键并选中它。
      *
      * 创建完立刻选中：新建的键默认在屏幕正中，多半要挪，
@@ -5276,6 +5456,9 @@ public class GamepadView extends PickList {
         //   于是批量删除列表里根本列不出它，删不掉。
         if (PadLayout.isComboSlot(i)) {
             return mLayout.isComboUsed(i);
+        }
+        if (PadLayout.isMouseSlot(i)) {
+            return mLayout.isMouseUsed(i);
         }
         return mLayout.isPadUsed(i) && !PadLayout.isUiButton(i);
     }
@@ -6395,6 +6578,38 @@ public class GamepadView extends PickList {
             }
             return;
         }
+        /*
+          鼠标三件套。
+          必须在 applyFloatingStick 和后面的 proto switch 之前拦下：
+          它们的 proto 是 I_MOUSE_PAD 这种大下标，落进 default 会去调
+          toButtonIndex(elem)，按 GamepadReport 的按钮表越界取值。
+        */
+        if (PadLayout.isMouseSlot(elem) && mLayout.isMouseUsed(elem)) {
+            mDown[elem] = 1;
+            if (elem == PadLayout.I_MOUSE_PAD) {
+                // 触摸板：只记起点，位移在 onMove 里按增量发
+                mMouseLastX = x;
+                mMouseLastY = y;
+                // 预览线的原点 = 手指按下的位置，不是触摸板中心
+                mMouseOriginX = x;
+                mMouseOriginY = y;
+                mMouseAccX = 0;
+                mMouseAccY = 0;
+                mMouseMoved = false;
+            } else {
+                int b = mouseButtonOf(elem);
+                if (b >= 0) {
+                    mSink.onMouseButton(b, true);
+                } else {
+                    // 滚轮：没有"按住"这个概念，按一下滚一格。
+                    // 每次点都发，长按不会连发 —— 要连续滚就连续点。
+                    mSink.onMouseWheel(mouseWheelOf(elem));
+                }
+            }
+            invalidate();
+            return;
+        }
+
         // 【浮动摇杆：按下时先瞬移】
         //
         //   关掉"固定摇杆"后，手指落在摇杆的范围圈内按下 ——
@@ -6669,6 +6884,33 @@ public class GamepadView extends PickList {
     }
 
     private void onMove(int elem, float x, float y) {
+        /*
+          触摸板：按"上一次位置 -> 这次位置"的增量发，不是绝对坐标。
+          【为什么每次发完就把 last 挪到当前点】
+            这是增量模型，last 必须跟着实际发出去的量走，
+            否则手指停一下再动会一次性补发攒下的位移，光标"抽一下"。
+        */
+        if (PadLayout.isMouseSlot(elem) && mLayout != null
+                && mLayout.isMouseUsed(elem)) {
+            if (elem == PadLayout.I_MOUSE_PAD) {
+                int dx = Math.round((x - mMouseLastX) * MOUSE_SENS);
+                int dy = Math.round((y - mMouseLastY) * MOUSE_SENS);
+                if (dx != 0 || dy != 0) {
+                    mMouseMoved = true;
+                    if (sMouseDefer) {
+                        // 松手才发：这里一个字节都不往外发，只记账。
+                        // 滑动全程没有鼠标事件 = 没有"输入源变了" = 收不到 CANCEL。
+                        mMouseAccX += dx;
+                        mMouseAccY += dy;
+                    } else {
+                        mSink.onMouseMove(clampDelta(dx), clampDelta(dy));
+                    }
+                    mMouseLastX = x;
+                    mMouseLastY = y;
+                }
+            }
+            return;
+        }
         // 十字架组合键：手指滑动换方向（普通组合键不参与，它只有一个方向）
         if (PadLayout.isComboSlot(elem) && mLayout != null
                 && mLayout.isComboUsed(elem) && mLayout.comboCross[elem]) {
@@ -6742,6 +6984,46 @@ public class GamepadView extends PickList {
     }
 
     private void onUp(int elem) {
+        if (PadLayout.isMouseSlot(elem) && mLayout != null
+                && mLayout.isMouseUsed(elem)) {
+            mDown[elem] = 0;
+            if (elem == PadLayout.I_MOUSE_PAD) {
+                // 双击触摸板 = 切换发送时机（测试用，好来回对比）
+                long now = System.currentTimeMillis();
+                if (!mMouseMoved && now - mMouseTapMs < 400) {
+                    sMouseDefer = !sMouseDefer;
+                    mMouseTapMs = 0;
+                    toastLocal(sMouseDefer
+                            ? "鼠标：松手才发（滑动中不发事件）"
+                            : "鼠标：边滑边发（实时）");
+                } else if (!mMouseMoved) {
+                    mMouseTapMs = now;
+                }
+                if (sMouseDefer) {
+                    // 一次性把整段位移吐出去。int8 一帧最多带 127，
+                    // 所以拆成多帧发，每帧大小和正常拖动时一样。
+                    int ax = Math.round(mMouseAccX);
+                    int ay = Math.round(mMouseAccY);
+                    while (ax != 0 || ay != 0) {
+                        int sx = clampDelta(ax);
+                        int sy = clampDelta(ay);
+                        mSink.onMouseMove(sx, sy);
+                        ax -= sx;
+                        ay -= sy;
+                    }
+                    mMouseAccX = 0;
+                    mMouseAccY = 0;
+                }
+            } else {
+                int b = mouseButtonOf(elem);
+                // 滚轮不发抬起：它本来就没按下过
+                if (b >= 0) {
+                    mSink.onMouseButton(b, false);
+                }
+            }
+            invalidate();
+            return;
+        }
         // 【浮动摇杆：抬手归位】
         //   瞬移是临时的，松手必须回到原位，否则摇杆会一路跟着手指
         //   漂走，越漂越远 —— 那不是"浮动"，那是"被拖走了"。
@@ -7029,6 +7311,15 @@ public class GamepadView extends PickList {
                 drawElem(c, i);
             }
         }
+        // 鼠标三件套。
+        // 它们的下标在数组末尾（I_FLOAT 之后），不在 isPadSlot 范围内，
+        // 主循环那两趟按 isPadUsed 过滤，会直接把它们跳过 ——
+        // 所以和空白按钮一样单独一趟，画在普通按键之上。
+        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
+            if (mLayout.isMouseUsed(i)) {
+                drawElem(c, i);
+            }
+        }
         // 动态创建的键盘按键。只画已创建的（空槽位由 shouldDraw 挡掉）。
         // 名字来自它创建时选的键，比如 "W"、"空格"。
         for (int i = PadLayout.I_KEY0; i < PadLayout.N_KEY_END; i++) {
@@ -7288,6 +7579,127 @@ public class GamepadView extends PickList {
     }
 
     /** 按 padType 把一个槽位画成对应的元素。 */
+    /**
+     * 触摸板：就是一块矩形底板，外加一个中心十字表明"这是拖动区"。
+     *
+     * 【为什么不画准星】
+     *   相对鼠标没有"当前位置"——指针画在哪是 system_server 的事，
+     *   App 读不到、也不需要读。画个假准星只会和真箭头打架。
+     */
+    /**
+     * 触摸板就是一块矩形，除了边框和名字不画别的。
+     *
+     * 【原来那个十字架去掉了】
+     *   它本来是想标出"中心点"，但触摸板是拖动区、不是摇杆 ——
+     *   没有"回中"这回事，中心点不代表任何状态，
+     *   画上去反而像十字键或者瞄准准星，误导人以为要按住中心。
+     *
+     * 【松手模式下的位移预览】
+     *   松手才发时全程光标不动、抬手才跳一大段，
+     *   滑的时候根本不知道会跳多远、往哪跳，没法控制力度。
+     *   所以在触摸板中间画一支箭头：
+     *     方向 = 松手后光标会走的方向
+     *     长度 = 会走多远（按手指位移 1:1 画，超出触摸板就顶到边）
+     *
+     *   它预览的是**位移向量**，不是"光标会落在屏幕哪个点"。
+     *   落点画不出来 —— 系统光标位置归系统自己维护，App 读不到，
+     *   自己积分去猜的话，越过屏幕边界、被别的输入源动过之后就越偏越远。
+     *   而"往哪走、走多远"既是准确的，也正是松手模式真正缺的那条信息。
+     */
+    /**
+     * 触摸板就是一块矩形，除了边框和名字不画别的。
+     *
+     * 【原来那个十字架去掉了】
+     *   它本来是想标出"中心点"，但触摸板是拖动区、不是摇杆 ——
+     *   没有"回中"这回事，中心点不代表任何状态，
+     *   画上去反而像十字键或者瞄准准星，误导人以为要按住中心。
+     *
+     * 【松手模式下的落点预览】
+     *   松手才发时全程光标不动、抬手才跳一大段，
+     *   滑的时候根本不知道会跳多远、往哪跳，没法控制力度。
+     *
+     *   所以以**手指按下的位置**为原点，把累计偏移**原样**画成一个点，
+     *   再从原点连一条线过去：
+     *     接到 X+8、Y+9   -> 点在起点右 8px、下 9px
+     *     再接 X+10       -> 点移到起点右 18px、下 9px
+     *
+     * 【为什么原点用手指起点而不是触摸板中心】
+     *   手指在板子最左边按下，线就从最左边长出去 ——
+     *   画出来的那一段和手指真正划过的那一段是重合的，
+     *   目光不用在"手指"和"板中心"之间来回跳，拖起来更跟手。
+     *
+     * 【为什么不夹在触摸板里】
+     *   夹取之后点会顶在边界不动，手指继续划就看不出变化了 ——
+     *   恰恰是最需要反馈的长距离滑动没了反馈。
+     *   所以不 clamp：手指划出多远，点就跑多远，
+     *   哪怕画到别的按键上面。看到的就是手指的真实行程。
+     *   点跑出去了也说明"该松手了"，本身就是个提示。
+     *
+     * 【预览的是位移，不是光标落点】
+     *   画不出"光标会停在屏幕哪个点" —— 系统光标的位置归系统自己维护，
+     *   App 读不到；自己积分去猜的话，光标顶到屏幕边界、
+     *   或被别的输入源动过之后就越偏越远。
+     *   而"手指走了多远"既是准确的，也正是松手模式真正缺的那条信息。
+     */
+    private void drawMousePad(Canvas c, int i) {
+        // 原名字（用户改过名就用改过的）+ 提示行。
+        // forceLabel=true 是必须的：不强制的话 customName 会把整串顶掉。
+        drawBtn(c, i, mLayout.displayName(i, "触摸板") + "\n双击切模式", true);
+        if (!sMouseDefer || !shouldDraw(i) || mDown[i] != 1) return;
+        // 预览开关（设置里那个，默认关）。关了就不画，鼠标照常能拖。
+        if (!mousePreviewOn(getContext())) return;
+        float ax = mMouseAccX;
+        float ay = mMouseAccY;
+        if (ax == 0f && ay == 0f) return;
+        // acc 是乘过灵敏度的光标位移，除回去就是手指实际划过的距离。
+        float fx = ax / MOUSE_SENS;
+        float fy = ay / MOUSE_SENS;
+        float len = (float) Math.hypot(fx, fy);
+        if (len < 1f) return;
+
+        // 原点 = 手指按下的位置（不是触摸板中心）
+        float cx = mMouseOriginX;
+        float cy = mMouseOriginY;
+        // 【不夹取】点画在 起点 + 手指偏移，超出触摸板范围照画。
+        float ex = cx + fx;
+        float ey = cy + fy;
+        // 点要压在半透明的触摸板上还能看清，所以比元素本身实一档
+        float pa = Math.min(1f, effAlpha(i) + 0.3f);
+
+        int oldColor = mRingPaint.getColor();
+        float oldW = mRingPaint.getStrokeWidth();
+        try {
+            setA(mRingPaint, pa);
+            // 中心 -> 点 的连线：点跑远了也能看出是从哪来的
+            mRingPaint.setStrokeWidth(Math.max(2.0f, oldW * 1.2f));
+            c.drawLine(cx, cy, ex, ey, mRingPaint);
+            // 点本身：实心圆，比线粗，好认
+            float dotR = Math.max(4f, oldW * 2.2f);
+            c.drawCircle(ex, ey, dotR, mRingPaint);
+            resetA(mRingPaint);
+        } finally {
+            mRingPaint.setStrokeWidth(oldW);
+            mRingPaint.setColor(oldColor);
+        }
+
+        // Δ 数值：跟着点走，给确切会发出的光标像素位移
+        float oldSize = mTextPaint.getTextSize();
+        Paint.Align oldAlign = mTextPaint.getTextAlign();
+        try {
+            mTextPaint.setTextSize(oldSize * 0.66f);
+            mTextPaint.setTextAlign(Paint.Align.CENTER);
+            setA(mTextPaint, pa);
+            // 沿位移方向再让开一点，免得压在点上
+            c.drawText("Δ" + Math.round(ax) + "," + Math.round(ay),
+                    ex + (fx / len) * 16f,
+                    ey + (fy / len) * 16f, mTextPaint);
+            resetA(mTextPaint);
+        } finally {
+            mTextPaint.setTextSize(oldSize);
+            mTextPaint.setTextAlign(oldAlign);
+        }
+    }
+
     private void drawElem(Canvas c, int i) {
         int proto = PadLayout.protoOfType(mLayout.padType[i]);
         switch (proto) {
@@ -7308,6 +7720,24 @@ public class GamepadView extends PickList {
                 break;
             case PadLayout.I_R2:
                 drawTrigger(c, i, "R2");
+                break;
+            case PadLayout.I_MOUSE_PAD:
+                drawMousePad(c, i);
+                break;
+            case PadLayout.I_MOUSE_L:
+                drawBtn(c, i, "左键");
+                break;
+            case PadLayout.I_MOUSE_R:
+                drawBtn(c, i, "右键");
+                break;
+            case PadLayout.I_MOUSE_M:
+                drawBtn(c, i, "中键");
+                break;
+            case PadLayout.I_MOUSE_WU:
+                drawBtn(c, i, "滚轮上");
+                break;
+            case PadLayout.I_MOUSE_WD:
+                drawBtn(c, i, "滚轮下");
                 break;
             default:
                 drawBtn(c, i, padLabel(proto));
@@ -7579,6 +8009,20 @@ public class GamepadView extends PickList {
     }
 
     private void drawBtn(Canvas c, int i, String label) {
+        drawBtn(c, i, label, false);
+    }
+
+    /**
+     * @param forceLabel true = 直接用 label，不再让 customName 顶掉。
+     *
+     * 【为什么需要它】
+     *   displayName(i, label) 的规则是"customName 非空就返回 customName"，
+     *   整串 label 被扔掉。而 resetMouse() 给触摸板设了
+     *   customName = "触摸板" —— 于是 drawMousePad 拼的
+     *   "触摸板\n双击切模式" **从来没显示过**，只显示"触摸板"。
+     *   要在原名后面接提示行，就必须绕过那条覆盖规则。
+     */
+    private void drawBtn(Canvas c, int i, String label, boolean forceLabel) {
         if (!shouldDraw(i)) return;
         float a = effAlpha(i);
         float r = radiusOf(i);
@@ -7591,7 +8035,7 @@ public class GamepadView extends PickList {
         drawButtonBody(c, i, mDown[i] == 1 ? mBtnOnPaint : mBtnPaint);
         drawButtonOutline(c, i, mRingPaint);
         if (mLayout.labelOn(i)) {
-            drawLabelScaled(c, mLayout.displayName(i, label),
+            drawLabelScaled(c, forceLabel ? label : mLayout.displayName(i, label),
                     mPx[i], mPy[i], a, mLayout.textScale[i]);
         }
         resetA(mBtnPaint);
@@ -7680,6 +8124,10 @@ public class GamepadView extends PickList {
         }
         // 同上：没建的组合键槽位不画
         if (PadLayout.isComboSlot(i) && !mLayout.isComboUsed(i)) {
+            return false;
+        }
+        // 鼠标三件套只在鼠标布局里存在（padType 由 resetMouse 设上）
+        if (PadLayout.isMouseSlot(i) && !mLayout.isMouseUsed(i)) {
             return false;
         }
         return mEditMode || !mLayout.hidden[i];

@@ -1163,6 +1163,21 @@ public class FloatingService extends Service implements GamepadView.Sink {
         mLink.key(usage, pressed);
     }
 
+    @Override
+    public void onMouseMove(int dx, int dy) {
+        mLink.mouseMove(dx, dy);
+    }
+
+    @Override
+    public void onMouseButton(int btn, boolean pressed) {
+        mLink.mouseButton(btn, pressed);
+    }
+
+    @Override
+    public void onMouseWheel(int notches) {
+        mLink.mouseWheel(notches);
+    }
+
     /**
      * 手机横竖屏切换时（本 app 不再锁死竖屏）刷新一次屏幕尺寸。
      * 覆盖层是 MATCH_PARENT 的，尺寸会跟着变，GamepadView 会根据新的
