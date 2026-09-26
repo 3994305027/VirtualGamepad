@@ -3668,9 +3668,15 @@ public class MainActivity extends Activity {
         cbAuto.setPadding(padA, padA, padA, padA);
 
         android.widget.TextView cbTip = new android.widget.TextView(this);
+        // 【说清设置入口在哪】
+        //   原来只写「⋯ → 设置」，没说那个 ⋯ 在屏幕的哪个位置。
+        //   第一次打开软件的人不知道"⋯"是主界面右上角那个，
+        //   于是以为选了就不能改 —— 这是联网相关选项，
+        //   必须让人一眼知道能随时关掉，位置写明白才算数。
         cbTip.setText("勾选后，每次进入软件会在后台比对一次版本，"
                 + "标题旁显示「正在检查更新…」，有新版才弹窗。"
-                + "也可在「⋯ → 设置」里随时关闭。");
+                + "之后随时可以在主界面右上角的「⋯ → 设置」里改，"
+                + "关掉后只有手动点「检查更新」才会联网。");
         cbTip.setTextSize(11f);
         cbTip.setTextColor(0xFF666666);
         cbTip.setPadding(padA, 0, padA, padA);

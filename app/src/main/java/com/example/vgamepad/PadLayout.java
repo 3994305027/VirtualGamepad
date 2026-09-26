@@ -512,8 +512,12 @@ public final class PadLayout {
      *
      *   现在鼠标布局走自己的版本号，以后改 resetMouse 就 +1。
      */
-    private static final int LAYOUT_VERSION_MOUSE_P = 6;
-    private static final int LAYOUT_VERSION_MOUSE_L = 6;
+    // 7：横屏触摸板下移（0.62 → 0.70）+ 穿透按钮默认显示。
+    //   两个都 +1 —— 横竖屏共用一套鼠标模板代码，
+    //   穿透那条两个方向都要重建才生效（用鼠标的人多半是横屏，
+    //   但竖屏下也该默认开着，不然点不中的困惑一样会出现）。
+    private static final int LAYOUT_VERSION_MOUSE_P = 7;
+    private static final int LAYOUT_VERSION_MOUSE_L = 7;
 
     /** 当前是键盘模式（true）还是手柄模式（false）。 */
     public boolean keyboardMode;
@@ -1107,6 +1111,24 @@ public final class PadLayout {
         // 组合键：列表里显示它自己的名字（可能是自动拼的 "A+B"）
         if (isComboUsed(i)) {
             return comboName[i];
+        }
+        // 【鼠标元素：回退到 customName】
+        //   触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下 六个槽位
+        //   排在 I_FLOAT 之后，下标早就超出 N_FIXED(22)，
+        //   既不是 isPadSlot 也不是 isBlankUsed / isKeySlot。
+        //   不写这一段就会一路掉到最后的兜底 NAMES[i] ——
+        //   NAMES 只有 22 项，下标 54..59 直接越界取不到，
+        //   于是列表里每一行都是空字符串。
+        //
+        //   名字本身由 resetMouse / resetMouseSlot 写进 customName
+        //   （"触摸板" "左键" …），改过名就显示改过的。
+        //   放在 isComboUsed 之后：组合键那段用的是 comboName，
+        //   两个互不干扰，顺序无所谓，但别放在 isBlankUsed 之前 ——
+        //   空白那段会先命中（槽位不同，其实不会），保持离得近好读。
+        if (isMouseUsed(i)) {
+            String mn = (customName != null && i < customName.length
+                    && customName[i] != null) ? customName[i].trim() : "";
+            return mn.length() > 0 ? mn : "鼠标键";
         }
         if (isKeySlot(i) && keyCode[i] != 0) {
             // 加 [键盘] 是为了在"重置单个 / 互换位置 / 隐藏按钮"这类列表里
@@ -2032,6 +2054,17 @@ public final class PadLayout {
             resetMouse(w, h, portrait);
             applyFixedInit(ctx, tpl, "pad");
             applyFixedInit(ctx, tpl, "key");
+            // 【穿透按钮默认显示】
+            //   resetBlank → layoutUiButtons 里把「透」设成 hidden=true
+            //   （它是调试向开关，手柄布局不该一上来就占地方）。
+            //   但鼠标布局不一样：虚拟鼠标是给"隔着悬浮窗操作下面的界面"
+            //   用的，穿透开着才能真正点到下面的东西 ——
+            //   藏起来的话，用户装完会以为鼠标点不中，其实是穿透没开。
+            //
+            //   【必须排在 applyFixedInit 之后】
+            //   它内部"先强制显示 shw、再套隐藏 hid"，
+            //   写在前面会被 hid 那一步盖回去，等于白设。
+            hidden[I_PASS] = false;
             floatBallStyle(this);
             applyFloatVisibility(this);
             return;
@@ -2641,7 +2674,14 @@ public final class PadLayout {
         widthMul[I_MOUSE_PAD] = MOUSE_PAD_W_MUL;
         heightMul[I_MOUSE_PAD] = MOUSE_PAD_H_MUL;
         rx[I_MOUSE_PAD] = 0.5f;
-        ry[I_MOUSE_PAD] = portrait ? 0.66f : 0.62f;
+        // 【横屏往下挪了一截：0.62 → 0.70】
+        //   横屏时屏幕高度小，0.62 让触摸板压在中间偏上，
+        //   和上面那排中键列（0.26 / 0.38 / 0.50）挨得太近，
+        //   拇指拖触摸板容易蹭到中键。
+        //   下移到 0.70 后：半高按 maxHH = 0.20h 算，底部落在 0.90h，
+        //   不会顶出屏幕下沿；竖屏 0.66 不动 —— 竖屏空间够，
+        //   下移反而会让手指够不着左右键。
+        ry[I_MOUSE_PAD] = portrait ? 0.66f : 0.70f;
         customName[I_MOUSE_PAD] = "触摸板";
         showLabel[I_MOUSE_PAD] = true;
         alpha[I_MOUSE_PAD] = MOUSE_PAD_ALPHA;

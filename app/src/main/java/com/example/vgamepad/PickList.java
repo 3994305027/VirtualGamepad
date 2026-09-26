@@ -308,8 +308,15 @@ abstract class PickList extends View {
     static final int[] LEGEND_COLOR = {
             FXC_SHOW, FXC_HIDE, FXC_DEL, FXC_DEF
     };
+    /*
+      【下标 0..2 必须等于 TPL_BLANK / TPL_PAD / TPL_KEYBOARD】
+        buildFixRows(item) 直接把下标当模板 id 用，错一位就全错。
+        下标 3 = TPL_MOUSE（鼠标模板），
+        下标 4 = 功能键入口，它的编号是 GamepadView 的 FX_UI_ENTRY = 4
+        —— 必须避开真实模板 id，不然和鼠标模板撞号。
+    */
     static final String[] FX_TPL_NAMES = {
-            "空白模板", "手柄模板", "键盘模板", "功能键"
+            "空白模板", "手柄模板", "键盘模板", "鼠标模板", "功能键"
     };
     static final String[] CAT_NAMES =
             {"全部", "手柄", "键盘", "空白", "组合", "功能"};
@@ -459,7 +466,12 @@ abstract class PickList extends View {
     static final int FX_ACT_PAD = -1;      // 「＋ 添加手柄键…」
     static final int FX_ACT_KEY = -2;      // 「＋ 添加键盘键…」
     static final String[] FX_TPL_SHORT = {"空", "手", "键"};
-    static final String[] TPL_NAMES = {"空白模板", "手柄模板", "键盘模板"};
+    // 【下标必须和 PadLayout 的 TPL_* 常量对上】
+    //   点某一行是 mPendingTpl = pos，直接拿去当模板 id 用：
+    //   TPL_BLANK=0 / TPL_PAD=1 / TPL_KEYBOARD=2 / TPL_MOUSE=3。
+    //   所以「鼠标模板」只能排在第 4 位，插到中间会让后面全错位
+    //   —— 选"键盘模板"却建出鼠标布局这种事最难查。
+    static final String[] TPL_NAMES = {"空白模板", "手柄模板", "键盘模板", "鼠标模板"};
 
     static final int[] TL_ORDER = {
             // —— 重置 ——
@@ -1803,9 +1815,13 @@ abstract class PickList extends View {
                 title = "固定显示：选模板";
                 break;
             case LIST_FIX:
+                // mFixTpl 只可能是 0..3（走 FX_UI_ENTRY 那条路时
+                // buildFixRows 会提前 return，不会把 4 写进 mFixTpl），
+                // 但 TPL_NAMES 里没有"功能键"这一项，越界保护留着，
+                // 免得以后加模板忘了同步这里就显示成空标题。
                 title = mFixUiMode ? "功能键：点「空/手/键」切换"
                         : "固定显示：" + ((mFixTpl >= 0 && mFixTpl < TPL_NAMES.length)
-                        ? TPL_NAMES[mFixTpl] : "") + "（点行切换）";
+                        ? TPL_NAMES[mFixTpl] : "模板") + "（点行切换）";
                 break;
         }
         mBarTextPaint.setTextAlign(Paint.Align.CENTER);
@@ -3515,8 +3531,8 @@ abstract class PickList extends View {
             case LIST_RESET_DIM:   // 重置属性：4 项
             case LIST_SYNC_DIM:    // 同步属性：4 项
             case LIST_SYNC_DIR:    // 同步方向：2 项
-            case LIST_TPL:         // 选模板：3 项
-            case LIST_FIX_TPL:     // 固定显示：4 项
+            case LIST_TPL:         // 选模板：4 项（加鼠标模板后）
+            case LIST_FIX_TPL:     // 固定显示：5 项（加鼠标模板后）
             case LIST_CREATE:      // 按键创建类型：就 3 项，搜什么
             case LIST_MORE:        // 更多选项：就那么几项
             case LIST_COMBO_DELAY: // 延迟档位：12 档固定，搜什么

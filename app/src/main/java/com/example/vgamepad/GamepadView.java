@@ -3540,7 +3540,16 @@ public class GamepadView extends PickList {
 
 
 
-    private static final int FX_UI_ENTRY = 3;
+    /*
+      【必须避开真实模板 id】
+        这个值是"功能键"那一级列表的入口编号，
+        直接拿去和 TPL_* 比（buildFixRows 里 tpl == FX_UI_ENTRY）。
+        而 TPL_BLANK=0 / TPL_PAD=1 / TPL_KEYBOARD=2 / **TPL_MOUSE=3**。
+        写 3 的话它就和鼠标模板撞号：点"功能键"和点"鼠标模板"
+        走的是同一条路，鼠标模板永远选不到。
+        挪到 4（模板 id 目前最大是 3），以后加新模板也照这个规矩避让。
+    */
+    private static final int FX_UI_ENTRY = 4;
     /** 功能键那页的三个胶囊，对应三个真实模板 */
     private static final int[] FX_TPLS = {
             PadLayout.TPL_BLANK, PadLayout.TPL_PAD, PadLayout.TPL_KEYBOARD
@@ -3698,6 +3707,30 @@ public class GamepadView extends PickList {
             codes.add(Integer.valueOf(FX_BASE_KEY + u));
             names.add(PadLayout.keyName(u));
             mFixDefHide.put(Integer.valueOf(FX_BASE_KEY + u),
+                    Boolean.valueOf(base.hidden[i]));
+        }
+        // 2.5) 模板自带的鼠标元素（触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下）
+        //
+        // 【为什么单列一段】
+        //   1) 那段只遍历 0..N_FIXED(22)，而鼠标槽位在 I_FLOAT+1 ≈ 54，
+        //      根本进不了循环 —— 选了鼠标模板会得到一个空列表，
+        //      只剩两行「＋ 添加…」，看着像功能坏了。
+        //
+        // 【编号为什么复用 FX_BASE_PAD】
+        //   鼠标槽位下标 54..59，而 FX_BASE_PAD=0、FX_BASE_KEY=1000，
+        //   中间空了 900 多个编号，FX_BASE_PAD + 54 不会撞到键盘区。
+        //   fixState / fixCycle 里那段 code >= FX_BASE_PAD && < FX_BASE_KEY
+        //   的判断照样成立，读写的是 paddel / padshw / padhid 三份集合，
+        //   applyFixedInit 里对 i < N 的元素一律生效 —— 鼠标槽位也在 N 内，
+        //   所以"强制隐藏 / 强制显示 / 删除"这套机制本来就能管到它们，
+        //   只是以前列表里没列出来。
+        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
+            if (!base.isMouseUsed(i)) {
+                continue;
+            }
+            codes.add(Integer.valueOf(FX_BASE_PAD + i));
+            names.add(base.nameOf(i));
+            mFixDefHide.put(Integer.valueOf(FX_BASE_PAD + i),
                     Boolean.valueOf(base.hidden[i]));
         }
         // 3) 额外添加的手柄键
