@@ -130,6 +130,19 @@ public final class PadLayout {
     public static final int COMBO_START = BLANK_START + MAX_BLANK;
     /** 最多 16 个组合键。 */
     public static final int MAX_COMBO = 16;
+
+    /**
+     * 固定显示名单里"这是个十字架组合键"的标记位。
+     *
+     * 【编码方式】 序号 0..MAX_COMBO-1 = 普通按钮，加 100 = 十字架。
+     *   名单是 set，本来只能表示"有几个"；形状是第二个维度，
+     *   借高位塞进去，一个 set 就能同时记数量和形状，不用再开一个。
+     *
+     * 【为什么是 100 不是别的】 要大于 MAX_COMBO，否则和序号撞。
+     *   常量放这儿（数据层），GamepadView 和 PickList 都引用它，
+     *   两边各写一份迟早会不同步。
+     */
+    public static final int FX_COMBO_CROSS_BASE = 100;
     /**
      * 一个组合键里最多放几个动作（键 或 延迟）。
      *
@@ -1853,7 +1866,7 @@ public final class PadLayout {
                 + 0.30f * (MAX_TEXT_SCALE - MIN_TEXT_SCALE);
     }
 
-    private void applyFixedInit(Context ctx, int tpl, String ns) {
+    private void applyFixedInit(Context ctx, int tpl, String ns, int w, int h) {
         if (ctx == null) {
             return;
         }
@@ -1927,6 +1940,64 @@ public final class PadLayout {
                 int slot = addPad(i);
                 if (slot >= 0 && adh.contains(Integer.valueOf(i))) {
                     hidden[slot] = true;
+                }
+            }
+        }
+        //
+        // 4) 额外创建的鼠标 / 空白 / 组合键
+        //
+        //   【为什么只在 ns.equals("pad") 时做】
+        //     applyFixedInit 是按命名空间调两次的（"pad" 和 "key"），
+        //     写在这里不加判断就会各建一遍，数量翻倍。
+        //     这三类不属于手柄 / 键盘任何一个命名空间，借 "pad" 那次顺带做。
+        //
+        //   【为什么记"种类 / 第几个"而不是槽位下标】
+        //     鼠标六个槽位是固定的但装哪种不固定（addMouse 挑第一个空的填），
+        //     空白 / 组合键槽位更是每次 reset 都可能变 —— 记下标下次就对不上。
+        //     所以鼠标记种类（which），空白 / 组合键只记建几个。
+        if (!isKb) {
+            float defR = Math.min(w > 0 ? w : 1, h > 0 ? h : 1) * 0.075f;
+            //
+            // 【隐藏态和"额外添加的键"走同一套 adH 名单】
+            //   建出来之后立刻置 hidden —— 不然界面上标了"隐藏"，
+            //   实际还是显示，等于假状态。
+            java.util.Set<Integer> msH = fxLoad(ctx, tpl, "msadH");
+            for (Integer v : fxLoad(ctx, tpl, "msadd")) {
+                int slot = addMouse(v.intValue(), defR);
+                if (slot >= 0 && msH.contains(Integer.valueOf(v.intValue()))) {
+                    hidden[slot] = true;
+                }
+            }
+            java.util.Set<Integer> blH = fxLoad(ctx, tpl, "bladH");
+            java.util.ArrayList<Integer> bl =
+                    new java.util.ArrayList<Integer>(fxLoad(ctx, tpl, "bladd"));
+            java.util.Collections.sort(bl);
+            for (Integer v : bl) {
+                int slot = addBlank();
+                if (slot >= 0 && blH.contains(v)) {
+                    hidden[slot] = true;
+                }
+            }
+            //
+            // 【组合键按编码建，不是按数量建】
+            //   cmadd 里存的是"序号 + 形状标记"（见 FX_COMBO_CROSS_BASE）。
+            //   只按 size() 建的话，选了十字架也会建成普通按钮 ——
+            //   那是假选项：界面上问了，建出来还是老样子。
+            java.util.Set<Integer> cmH = fxLoad(ctx, tpl, "cmadH");
+            java.util.ArrayList<Integer> cm =
+                    new java.util.ArrayList<Integer>(fxLoad(ctx, tpl, "cmadd"));
+            java.util.Collections.sort(cm);
+            for (Integer v : cm) {
+                int code = v.intValue();
+                boolean cross = code >= FX_COMBO_CROSS_BASE;
+                int seq = cross ? code - FX_COMBO_CROSS_BASE : code;
+                int idx = addCombo("组合键 " + (seq + 1));
+                if (idx >= 0) {
+                    comboCross[idx] = cross;
+                    comboDiag[idx] = true;
+                    if (cmH.contains(v)) {
+                        hidden[idx] = true;
+                    }
                 }
             }
         }
@@ -2052,8 +2123,8 @@ public final class PadLayout {
         if (tpl == TPL_MOUSE) {
             resetBlank(w, h, portrait, bottomLimit, topLimit);
             resetMouse(w, h, portrait);
-            applyFixedInit(ctx, tpl, "pad");
-            applyFixedInit(ctx, tpl, "key");
+            applyFixedInit(ctx, tpl, "pad", w, h);
+            applyFixedInit(ctx, tpl, "key", w, h);
             // 【穿透按钮默认显示】
             //   resetBlank → layoutUiButtons 里把「透」设成 hidden=true
             //   （它是调试向开关，手柄布局不该一上来就占地方）。
@@ -2073,8 +2144,8 @@ public final class PadLayout {
             resetBlank(w, h, portrait, bottomLimit, topLimit);
             // 空白模板没有现成的键可隐藏 / 删除，只有"添加"有意义。
             // 手柄键和键盘键两套命名空间都套一下 —— 空白上面两种都能加。
-            applyFixedInit(ctx, tpl, "pad");
-            applyFixedInit(ctx, tpl, "key");
+            applyFixedInit(ctx, tpl, "pad", w, h);
+            applyFixedInit(ctx, tpl, "key", w, h);
             floatBallStyle(this);
             applyFloatVisibility(this);
             return;
@@ -2125,8 +2196,8 @@ public final class PadLayout {
             resetKeyboard(w, h, portrait);
             // 两个命名空间都套：键盘模板上也能预先加几个手柄键
             // （"键"那套的 del/hid 在这里不起作用 —— 固定手柄键已经全删了）
-            applyFixedInit(ctx, tpl, "key");
-            applyFixedInit(ctx, tpl, "pad");
+            applyFixedInit(ctx, tpl, "key", w, h);
+            applyFixedInit(ctx, tpl, "pad", w, h);
             floatBallStyle(this);
             applyFloatVisibility(this);
             return;
@@ -2339,9 +2410,9 @@ public final class PadLayout {
         // 手柄模板：末尾套用「固定显示」的覆盖。
         // 放在最后 —— 必须在所有 setPx 之后，不然覆盖里"删掉/隐藏"
         // 的决定会被后面的摆放又写回来。
-        applyFixedInit(ctx, tpl, "pad");
+        applyFixedInit(ctx, tpl, "pad", w, h);
         // 手柄模板上也能预先加几个键盘键（比如常玩的游戏要按的字母）
-        applyFixedInit(ctx, tpl, "key");
+        applyFixedInit(ctx, tpl, "key", w, h);
         floatBallStyle(this);
     }
 

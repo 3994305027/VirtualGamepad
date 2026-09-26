@@ -3492,6 +3492,23 @@ public class GamepadView extends PickList {
     private static final int FX_ADD_KEY = 3000;    // + HID usage
     /** 功能键（界面按钮）：+ 在 UI_ELEMS 里的序号，不是元素下标 */
     private static final int FX_BASE_UI = 4000;
+    /**
+     * 固定显示里"额外创建"的鼠标 / 空白 / 组合键。
+     *
+     * 【为什么又开三段，不挤进 padadd】
+     *   padadd 存的是**手柄原型下标**，交给 addPad() 动态分配槽位；
+     *   而鼠标槽位是固定的六个、空白和组合键槽位是动态分配、
+     *   下标每次 reset 都可能变 —— 三类都记不住"槽位下标"，
+     *   只能记"种类 / 第几个"。混进 padadd 会被 addPad 当成原型建错东西。
+     *
+     * 【为什么排在 FX_ADD_KEY(3000) 之上】
+     *   fixState / fixCycle 里 FX_ADD_KEY 那段用的是 `code >= FX_ADD_KEY`
+     *   敞口判断，写在它下面会被当成"额外添加的键盘键"处理。
+     *   三段都在 3000 之上，判定顺序里也必须排在 FX_ADD_KEY 之前。
+     */
+    private static final int FX_BASE_MOUSE = 5000;   // + 鼠标种类 which
+    private static final int FX_BASE_BLANK = 6000;   // + 第几个（0 起）
+    private static final int FX_BASE_COMBO = 7000;   // + 第几个（0 起）
 
     /**
      * 四个功能键 = 界面按钮。它们**不能删除** ——
@@ -3550,9 +3567,16 @@ public class GamepadView extends PickList {
         挪到 4（模板 id 目前最大是 3），以后加新模板也照这个规矩避让。
     */
     private static final int FX_UI_ENTRY = 4;
-    /** 功能键那页的三个胶囊，对应三个真实模板 */
+    /**
+     * 功能键那页的四个胶囊，对应四个真实模板。
+     *
+     * 【必须和 PickList.FX_TPL_SHORT 一一对应、长度一致】
+     *   胶囊按 FX_TPL_SHORT 的长度画（PickList 是父类，看不到这个数组），
+     *   点第 k 个胶囊时 tplIdx = k 又拿去索引这里 —— 少一项就越界。
+     */
     private static final int[] FX_TPLS = {
-            PadLayout.TPL_BLANK, PadLayout.TPL_PAD, PadLayout.TPL_KEYBOARD
+            PadLayout.TPL_BLANK, PadLayout.TPL_PAD,
+            PadLayout.TPL_KEYBOARD, PadLayout.TPL_MOUSE
     };
 
     /** 三态：0 显示 / 1 隐藏 / 2 删除 / 3 跟随模板默认（功能键才有） */
@@ -3583,9 +3607,32 @@ public class GamepadView extends PickList {
             int p = code - FX_ADD_PAD;
             return PadLayout.fxHas(ctx, tpl, "padadH", p) ? ST_HIDE : ST_DEF;
         }
-        if (code >= FX_ADD_KEY) {
+        if (code >= FX_ADD_KEY && code < FX_BASE_MOUSE) {
             int u = code - FX_ADD_KEY;
             return PadLayout.fxHas(ctx, tpl, "keyadH", u) ? ST_HIDE : ST_DEF;
+        }
+        //
+        // 【额外创建的鼠标 / 空白 / 组合键：和"额外添加的键"同一套三态】
+        //   在名单里 + 没标隐藏 = 显示（ST_DEF）
+        //   在名单里 + 标了隐藏 = 隐藏（ST_HIDE）
+        //   不在名单里           = 删除（ST_DEL，行消失）
+        //
+        //   以前这三类只有两态，点一下直接进 ST_DEL —— 于是"点一下就没了"。
+        //   隐藏态存在各自的 adH 名单里，建出来时由 PadLayout 置 hidden。
+        if (code >= FX_BASE_MOUSE && code < FX_BASE_BLANK) {
+            int v = code - FX_BASE_MOUSE;
+            if (PadLayout.fxHas(ctx, tpl, "msadH", v)) return ST_HIDE;
+            return PadLayout.fxHas(ctx, tpl, "msadd", v) ? ST_DEF : ST_DEL;
+        }
+        if (code >= FX_BASE_BLANK && code < FX_BASE_COMBO) {
+            int v = code - FX_BASE_BLANK;
+            if (PadLayout.fxHas(ctx, tpl, "bladH", v)) return ST_HIDE;
+            return PadLayout.fxHas(ctx, tpl, "bladd", v) ? ST_DEF : ST_DEL;
+        }
+        if (code >= FX_BASE_COMBO) {
+            int v = code - FX_BASE_COMBO;
+            if (PadLayout.fxHas(ctx, tpl, "cmadH", v)) return ST_HIDE;
+            return PadLayout.fxHas(ctx, tpl, "cmadd", v) ? ST_DEF : ST_DEL;
         }
         return ST_SHOW;
     }
@@ -3650,7 +3697,7 @@ public class GamepadView extends PickList {
             } else {
                 PadLayout.fxToggle(ctx, tpl, "padadH", p);
             }
-        } else if (code >= FX_ADD_KEY) {
+        } else if (code >= FX_ADD_KEY && code < FX_BASE_MOUSE) {
             int u = code - FX_ADD_KEY;
             if (next == ST_DEL) {
                 PadLayout.fxSave(ctx, tpl, "keyadd", remove1(PadLayout.fxLoad(ctx, tpl, "keyadd"), u));
@@ -3658,8 +3705,123 @@ public class GamepadView extends PickList {
             } else {
                 PadLayout.fxToggle(ctx, tpl, "keyadH", u);
             }
+        } else if (code >= FX_BASE_MOUSE && code < FX_BASE_BLANK) {
+            //
+            // 【和"额外添加的手柄键"同一套】显示 -> 隐藏 -> 删除 -> 显示
+            //
+            //   鼠标记的是"种类"（六个固定种类），不是序号 ——
+            //   删掉哪个就是哪个，不需要重排。
+            int v = code - FX_BASE_MOUSE;
+            if (next == ST_DEL) {
+                PadLayout.fxSave(ctx, tpl, "msadd",
+                        remove1(PadLayout.fxLoad(ctx, tpl, "msadd"), v));
+                PadLayout.fxSave(ctx, tpl, "msadH",
+                        remove1(PadLayout.fxLoad(ctx, tpl, "msadH"), v));
+            } else {
+                PadLayout.fxToggle(ctx, tpl, "msadH", v);
+            }
+        } else if (code >= FX_BASE_BLANK && code < FX_BASE_COMBO) {
+            int v = code - FX_BASE_BLANK;
+            if (next == ST_DEL) {
+                // 删掉点中的那个并把编号重排；隐藏名单要跟着一起排，
+                // 否则"第 2 个是隐藏的"会错位到别的键上。
+                PadLayout.fxSave(ctx, tpl, "bladd",
+                        dropAndCompact(PadLayout.fxLoad(ctx, tpl, "bladd"), v));
+                PadLayout.fxSave(ctx, tpl, "bladH",
+                        dropAndCompact(PadLayout.fxLoad(ctx, tpl, "bladH"), v));
+            } else {
+                PadLayout.fxToggle(ctx, tpl, "bladH", v);
+            }
+        } else if (code >= FX_BASE_COMBO) {
+            int v = code - FX_BASE_COMBO;
+            if (next == ST_DEL) {
+                PadLayout.fxSave(ctx, tpl, "cmadd",
+                        dropAndCompact(PadLayout.fxLoad(ctx, tpl, "cmadd"), v));
+                PadLayout.fxSave(ctx, tpl, "cmadH",
+                        dropAndCompact(PadLayout.fxLoad(ctx, tpl, "cmadH"), v));
+            } else {
+                PadLayout.fxToggle(ctx, tpl, "cmadH", v);
+            }
         }
         invalidate();
+    }
+
+    /**
+     * 删掉 v 这一个，再把后面的往前挪，编号重新连成 0..n-1。
+     *
+     * 【为什么不能只删 v】
+     *   这类名单存的是"第几个"，中间留洞的话下次建出来数量就对不上
+     *   （size() 是 3 但实际只建出 1 个）。所以必须重排。
+     *
+     * 【为什么以前是 dropTail】
+     *   那版把 v 及其之后的全部删掉，于是点第一个 = 全删光 ——
+     *   用户看到的就是"点一下全没了"。删点中的那个再重排才对。
+     *
+     * 【形状分组各排各的】
+     *   十字架的编码带 100 的偏移（PadLayout.FX_COMBO_CROSS_BASE），
+     *   和普通的序号各成一串，删一个只影响自己那一串。
+     */
+    private static java.util.HashSet<Integer> dropAndCompact(
+            java.util.HashSet<Integer> set, int v) {
+        //
+        // 【不能因为 v 不在集合里就直接返回】
+        //   隐藏名单（bladH / cmadH）里未必有 v，但它后面的编号照样要往前挪 ——
+        //   否则删掉第 1 个之后，"第 2 个隐藏"会错位成"第 1 个隐藏"。
+        boolean cross = v >= PadLayout.FX_COMBO_CROSS_BASE;
+        int base = cross ? PadLayout.FX_COMBO_CROSS_BASE : 0;
+        int seq = v - base;
+        java.util.ArrayList<Integer> all = new java.util.ArrayList<Integer>(set);
+        java.util.Collections.sort(all);
+        java.util.HashSet<Integer> out = new java.util.HashSet<Integer>();
+        int n = 0;
+        for (Integer k : all) {
+            int kk = k.intValue();
+            if ((kk >= PadLayout.FX_COMBO_CROSS_BASE) != cross) {
+                out.add(Integer.valueOf(kk));   // 另一组不受影响，原样留着
+                continue;
+            }
+            if (kk - base == seq) {
+                continue;                        // 就是被点的那个
+            }
+            out.add(Integer.valueOf(base + n));
+            n++;
+        }
+        return out;
+    }
+
+    /** HashSet 的迭代顺序不保证，行序会随机跳 —— 排成升序再列。 */
+    private static java.util.ArrayList<Integer> sortedAsc(
+            java.util.HashSet<Integer> set) {
+        java.util.ArrayList<Integer> r = new java.util.ArrayList<Integer>(set);
+        java.util.Collections.sort(r);
+        return r;
+    }
+
+    /**
+     * 往"额外创建"的名单里加一个（空白 / 组合键这类没有种类可选的）。
+     *
+     * 编号取 0..n-1 里第一个空的 —— 名单只表示"建几个"，
+     * 中间不能有洞，否则 dropTail 从中间抽掉一个时后面的编号会错位。
+     */
+    void fixAddOne(String kind, boolean cross) {
+        // 软上限：模板自己还会带一些，超了 addBlank/addCombo 会返回 -1 静默少建，
+        // 与其让用户"加了却看不见"，不如在这儿就挡住。
+        int cap = "bladd".equals(kind) ? PadLayout.MAX_BLANK
+                : "cmadd".equals(kind) ? PadLayout.MAX_COMBO : 32;
+        java.util.HashSet<Integer> set = PadLayout.fxLoad(getContext(), mFixTpl, kind);
+        if (set.size() >= cap) {
+            toastLocal("这类最多建 " + cap + " 个，已经到上限了");
+            return;
+        }
+        // 只有组合键有形状这一维，借高位塞进同一个 set
+        int base = (cross && "cmadd".equals(kind))
+                ? PadLayout.FX_COMBO_CROSS_BASE : 0;
+        int n = 0;
+        while (set.contains(Integer.valueOf(base + n))) {
+            n++;
+        }
+        set.add(Integer.valueOf(base + n));
+        PadLayout.fxSave(getContext(), mFixTpl, kind, set);
     }
 
     private static java.util.HashSet<Integer> remove1(java.util.HashSet<Integer> set, int v) {
@@ -3743,11 +3905,38 @@ public class GamepadView extends PickList {
             codes.add(Integer.valueOf(FX_ADD_KEY + v.intValue()));
             names.add(PadLayout.keyName(v.intValue()) + "（新）");
         }
-        // 5) 两个"添加"入口
-        codes.add(Integer.valueOf(FX_ACT_PAD));
-        names.add("＋ 添加手柄键…");
-        codes.add(Integer.valueOf(FX_ACT_KEY));
-        names.add("＋ 添加键盘键…");
+        // 4.1) 额外创建的鼠标 / 空白 / 组合键
+        //
+        // 【只记"种类 / 第几个"，不记槽位下标】
+        //   鼠标是六个固定槽位但装哪种不固定（addMouse 挑第一个空的填），
+        //   空白 / 组合键槽位更是每次 reset 都可能不一样 ——
+        //   记下标下次就对不上了。所以鼠标记种类（which），
+        //   空白 / 组合键记 0..n-1 的连续序号，只表示"建几个"。
+        for (Integer v : sortedAsc(PadLayout.fxLoad(ctx, tpl, "msadd"))) {
+            codes.add(Integer.valueOf(FX_BASE_MOUSE + v.intValue()));
+            names.add(PadLayout.mouseNameOf(v.intValue()) + "（新）");
+        }
+        for (Integer v : sortedAsc(PadLayout.fxLoad(ctx, tpl, "bladd"))) {
+            codes.add(Integer.valueOf(FX_BASE_BLANK + v.intValue()));
+            names.add("空白 " + (v.intValue() + 1) + "（新）");
+        }
+        for (Integer v : sortedAsc(PadLayout.fxLoad(ctx, tpl, "cmadd"))) {
+            int vc = v.intValue();
+            boolean cross = vc >= PadLayout.FX_COMBO_CROSS_BASE;
+            int seq = cross ? vc - PadLayout.FX_COMBO_CROSS_BASE : vc;
+            codes.add(Integer.valueOf(FX_BASE_COMBO + vc));
+            // 形状写进名字里 —— 不然两个都叫"组合键 1"，分不出哪个是十字架
+            names.add("组合键 " + (seq + 1) + "（新" + (cross ? "·十字架" : "") + "）");
+        }
+        // 5) 一个"添加"入口
+        //
+        // 【只留一行，不按种类拆】
+        //   手柄 / 键盘 / 鼠标 / 空白 / 组合键拆开就是五行，底部太长。
+        //   点它直接进「按键创建」界面（LIST_CREATE），那五种都在里面，
+        //   选完由 createPad / createKey / createMouse / createBlank /
+        //   createCombo 各自的 mFixPicking 分支记进名单。
+        codes.add(Integer.valueOf(FX_ACT_ADD));
+        names.add("＋ 添加…");
 
         int n = codes.size();
         mFixCode = new int[n];
@@ -3807,7 +3996,7 @@ public class GamepadView extends PickList {
             return "";
         }
         int code = mFixCode[pos];
-        if (code == FX_ACT_PAD || code == FX_ACT_KEY || mFixUiMode) {
+        if (isFixAct(code) || mFixUiMode) {
             return mFixName[pos];
         }
         String tail = "";
@@ -4409,6 +4598,18 @@ public class GamepadView extends PickList {
             return;
         }
         int which = MOUSE_CANDIDATES[pos];
+        //
+        // 【「固定显示」的挑选模式：不真的建，只把种类记进该模板的名单】
+        //   必须排在下面"这个种类已经在布局上了"的检查**之前** ——
+        //   那个检查看的是 mLayout（当前布局），而固定显示管的是模板，
+        //   拿当前布局去判断"模板上有没有"会得出错的结论。
+        if (mFixPicking) {
+            mFixPicking = false;
+            PadLayout.fxToggle(getContext(), mFixTpl, "msadd", which);
+            buildFixRows(mFixTpl);
+            openList(LIST_FIX);
+            return;
+        }
         // 这个种类已经在布局上了 -> 直接选中它，不重复建
         for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
             if (mLayout.isMouseUsed(i)
@@ -4518,6 +4719,14 @@ public class GamepadView extends PickList {
      * 否则新元素会画在 (0,0)；然后立刻选中，好直接拖 / 调大小 / 删除。
      */
     void createBlank() {
+        // 「固定显示」的挑选模式：不真的建，只把"再建一个空白"记进名单
+        if (mFixPicking) {
+            mFixPicking = false;
+            fixAddOne("bladd", false);
+            buildFixRows(mFixTpl);
+            openList(LIST_FIX);
+            return;
+        }
         int idx = mLayout.addBlank();
         if (idx < 0) {
             toastLocal("空白按钮已达上限（" + PadLayout.MAX_BLANK + "个），先删一个再建");
@@ -4547,6 +4756,18 @@ public class GamepadView extends PickList {
     }
 
     void createCombo(boolean cross) {
+        // 「固定显示」的挑选模式：不真的建，只把"再建一个组合键"记进名单。
+        //
+        // 【形状是要记的】cross 由上层 LIST_COMBO_KIND 传进来，
+        //   借高位（FX_COMBO_CROSS_BASE）塞进同一个 set，建出来就是选的形状。
+        //   以前这版直接忽略了它，于是"问了形状却建出普通按钮" —— 假选项。
+        if (mFixPicking) {
+            mFixPicking = false;
+            fixAddOne("cmadd", cross);
+            buildFixRows(mFixTpl);
+            openList(LIST_FIX);
+            return;
+        }
         int idx = mLayout.addCombo("组合键");
         if (idx >= 0) {
             mLayout.comboCross[idx] = cross;

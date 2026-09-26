@@ -172,7 +172,8 @@ abstract class PickList extends View {
     String mComboAutoPrev = null;
     int mComboPickIdx = COMBO_PICK_NONE;
     boolean mFixUiMode = false;
-    final RectF[][] mFixTplRects = new RectF[8][3];
+    /** 功能键页的胶囊矩形：行数 × 模板数（模板数 = FX_TPL_SHORT.length）。 */
+    final RectF[][] mFixTplRects = new RectF[8][4];
     String mListQuery = "";
     final int[] mListFilter = new int[PadLayout.N + PadLayout.KEY_NAMES.length + 8];
     int mListFilterCount = 0;
@@ -463,9 +464,31 @@ abstract class PickList extends View {
     static final int DLG_CONFIRM_COMBO_RENAME = 9;
     static final int DLG_CONFIRM_KEY_RENAME = 10;
     static final int DLG_CONFIRM_KEY_COLOR = 11;
-    static final int FX_ACT_PAD = -1;      // 「＋ 添加手柄键…」
-    static final int FX_ACT_KEY = -2;      // 「＋ 添加键盘键…」
-    static final String[] FX_TPL_SHORT = {"空", "手", "键"};
+    /**
+     * 固定显示列表最后那个「＋ 添加…」的代号。
+     *
+     * 【只留一个入口，不按种类拆成五行】
+     *   手柄 / 键盘 / 鼠标 / 空白 / 组合键五种，拆开就是五行，
+     *   底部被撑得很长。而「按键创建」那个界面（LIST_CREATE）本来就把
+     *   这五种全列着，直接复用它 —— 点这一个入口进去选就行。
+     *   所以这里只需要一个"这是入口行"的标记，具体选哪种交给那一层。
+     */
+    static final int FX_ACT_ADD = -1;
+
+    /** 「＋ 添加…」是入口不是状态行：不上状态底色、行名也不带后缀。 */
+    static boolean isFixAct(int code) {
+        return code == FX_ACT_ADD;
+    }
+    /**
+     * 功能键那页每行右侧的胶囊。下标 = 模板序号，
+     * 和 GamepadView.FX_TPLS 一一对应（空 / 手 / 键 / 鼠）。
+     *
+     * 【加模板时要两边一起加】
+     *   胶囊按这个数组的长度画、按这个长度排布，
+     *   而点第 k 个胶囊时 fixUiState(pos, k) 拿 k 去索引 FX_TPLS。
+     *   只加 FX_TPLS 不改这里，第四个胶囊永远画不出来。
+     */
+    static final String[] FX_TPL_SHORT = {"空", "手", "键", "鼠"};
     // 【下标必须和 PadLayout 的 TPL_* 常量对上】
     //   点某一行是 mPendingTpl = pos，直接拿去当模板 id 用：
     //   TPL_BLANK=0 / TPL_PAD=1 / TPL_KEYBOARD=2 / TPL_MOUSE=3。
@@ -624,6 +647,8 @@ abstract class PickList extends View {
     abstract int comboFirstFreeSlot();
     abstract void closeGridCfg();
     abstract void buildFixRows(int tpl);
+    /** 固定显示里往"额外创建"名单加一个（空白 / 组合键这类没种类可选的）。 */
+    abstract void fixAddOne(String kind, boolean cross);
     abstract void applyAdjScale(float k);
     void afterComboPick() {
         if (mKeyKeepOpen) {
@@ -1819,7 +1844,7 @@ abstract class PickList extends View {
                 // buildFixRows 会提前 return，不会把 4 写进 mFixTpl），
                 // 但 TPL_NAMES 里没有"功能键"这一项，越界保护留着，
                 // 免得以后加模板忘了同步这里就显示成空标题。
-                title = mFixUiMode ? "功能键：点「空/手/键」切换"
+                title = mFixUiMode ? "功能键：点「空/手/键/鼠」切换"
                         : "固定显示：" + ((mFixTpl >= 0 && mFixTpl < TPL_NAMES.length)
                         ? TPL_NAMES[mFixTpl] : "模板") + "（点行切换）";
                 break;
@@ -2023,8 +2048,8 @@ abstract class PickList extends View {
                 if (mListMode == LIST_FIX) {
                     int rp = rawPos(pos);
                     int code = (rp >= 0 && rp < mFixCode.length)
-                            ? mFixCode[rp] : FX_ACT_PAD;
-                    if (code == FX_ACT_PAD || code == FX_ACT_KEY) {
+                            ? mFixCode[rp] : FX_ACT_ADD;
+                    if (isFixAct(code)) {
                         // 「＋ 添加…」是入口不是状态行，保持中性底色
                         c.drawRoundRect(r, dp(8f), dp(8f), mSlTrackPaint);
                         mBarTextPaint.setColor(0xFFDDDDDD);
@@ -2112,12 +2137,12 @@ abstract class PickList extends View {
             }
             // 布局列表的「改名 / 删」：内置两个（默认手柄 / 默认键盘）不给删，
             // 也不给改名 —— 它们是"更新覆盖"的锚点，改名后用户就认不出了。
-            // 功能键那页：每行右侧三个胶囊（空 / 手 / 键），
+            // 功能键那页：每行右侧一排胶囊（空 / 手 / 键 / 鼠），
             // 底色表示它在那个模板下是强制显示 / 强制隐藏 / 跟随默认。
             if (mListMode == LIST_FIX && mFixUiMode) {
                 mBarTextPaint.setTextSize(dp(12f));
                 for (int pos = 0; pos < n && pos < mFixTplRects.length; pos++) {
-                    for (int k = 0; k < 3; k++) {
+                    for (int k = 0; k < FX_TPL_SHORT.length; k++) {
                         RectF rc = mFixTplRects[pos][k];
                         if (rc.isEmpty()) {
                             continue;
@@ -2948,10 +2973,12 @@ abstract class PickList extends View {
             float x = left + pad + col * (iw + colGap);
             float iy = row * ih;
             if (fixUi) {
-                // 名字区让位给右侧三个胶囊，不然文字会压到胶囊上
-                float nameW = iw - (capW * 3f + capGap * 3f);
+                // 名字区让位给右侧那一排胶囊，不然文字会压到胶囊上。
+                // 胶囊数按 FX_TPL_SHORT.length 走，加模板时这里自动跟着变。
+                int nCap = FX_TPL_SHORT.length;
+                float nameW = iw - ((capW + capGap) * nCap);
                 mListItemRects[i].set(x, iy, x + nameW, iy + ih - dp(4f));
-                for (int k = 0; k < 3; k++) {
+                for (int k = 0; k < nCap; k++) {
                     float cx = x + nameW + capGap + k * (capW + capGap);
                     mFixTplRects[i][k].set(cx, iy + dp(8f), cx + capW,
                             iy + ih - dp(12f));
@@ -4438,12 +4465,12 @@ abstract class PickList extends View {
             askSearchList();
             return;
         }
-        // 功能键页：先判三个胶囊。它们压在行矩形右边，
+        // 功能键页：先判那一排胶囊。它们压在行矩形右边，
         // 整行判定会抢先把它们吃掉（和布局列表「改名/删」同理）。
         if (mListMode == LIST_FIX && mFixUiMode) {
             int n = listItemCount();
             for (int i = 0; i < n && i < mFixTplRects.length; i++) {
-                for (int k = 0; k < 3; k++) {
+                for (int k = 0; k < FX_TPL_SHORT.length; k++) {
                     if (hitListSub(mFixTplRects[i][k], x, y)) {
                         fixUiCycle(i, k);
                         return;
@@ -4477,15 +4504,13 @@ abstract class PickList extends View {
             }
             if (mListMode == LIST_FIX) {
                 int code = (item >= 0 && item < mFixCode.length)
-                        ? mFixCode[item] : FX_ACT_PAD;
-                if (code == FX_ACT_PAD) {
+                        ? mFixCode[item] : FX_ACT_ADD;
+                if (code == FX_ACT_ADD) {
+                    // 直接复用「按键创建」那个界面：五种都能建，
+                    // 在这儿拆成五行会把列表底部撑得老长。
+                    // mFixPicking 让后面的 createXxx 只记名单、不真建。
                     mFixPicking = true;
-                    openListBack(LIST_PAD, LIST_FIX);
-                    return;
-                }
-                if (code == FX_ACT_KEY) {
-                    mFixPicking = true;
-                    openListBack(LIST_KEY, LIST_FIX);
+                    openListBack(LIST_CREATE, LIST_FIX);
                     return;
                 }
                 fixCycle(mFixTpl, code);
@@ -4849,7 +4874,9 @@ abstract class PickList extends View {
                 return;
             }
             if (pos == CT_COMBO) {
-                // 先问做成"按钮"还是"十字架"
+                // 先问做成"按钮"还是"十字架"。
+                // 固定显示也问 —— 形状借高位存得进名单（FX_COMBO_CROSS_BASE），
+                // 建出来就是选的那个形状，不是假选项。
                 openListBack(LIST_COMBO_KIND, LIST_CREATE);
                 return;
             }
