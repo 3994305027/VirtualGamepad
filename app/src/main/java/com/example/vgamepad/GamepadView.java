@@ -930,18 +930,24 @@ public class GamepadView extends PickList {
     /**
      * 鼠标槽位 -> MouseReport 的按键号。
      * 触摸板不是按键，返回 -1；滚轮也不是按键，同样返回 -1。
+     *
+     * 【按槽位里装的"种类"判，不按下标判】
+     *   按下标判的话 I_MOUSE_L 这一个槽位就等于"左键"本身，
+     *   于是只能有一个左键。现在同一种类可以建好几个，各自都能按。
      */
-    private static int mouseButtonOf(int elem) {
-        if (elem == PadLayout.I_MOUSE_L) return MouseReport.BTN_LEFT;
-        if (elem == PadLayout.I_MOUSE_R) return MouseReport.BTN_RIGHT;
-        if (elem == PadLayout.I_MOUSE_M) return MouseReport.BTN_MIDDLE;
+    private int mouseButtonOf(int elem) {
+        int k = (mLayout == null) ? -1 : mLayout.mouseKindOf(elem);
+        if (k == 1) return MouseReport.BTN_LEFT;
+        if (k == 2) return MouseReport.BTN_RIGHT;
+        if (k == 3) return MouseReport.BTN_MIDDLE;
         return -1;
     }
 
     /** 滚轮槽位 -> 一次滚几格（正 = 向上）。不是滚轮返回 0。 */
-    private static int mouseWheelOf(int elem) {
-        if (elem == PadLayout.I_MOUSE_WU) return 2;
-        if (elem == PadLayout.I_MOUSE_WD) return -2;
+    private int mouseWheelOf(int elem) {
+        int k = (mLayout == null) ? -1 : mLayout.mouseKindOf(elem);
+        if (k == 4) return 2;
+        if (k == 5) return -2;
         return 0;
     }
 
@@ -3886,7 +3892,7 @@ public class GamepadView extends PickList {
         //   applyFixedInit 里对 i < N 的元素一律生效 —— 鼠标槽位也在 N 内，
         //   所以"强制隐藏 / 强制显示 / 删除"这套机制本来就能管到它们，
         //   只是以前列表里没列出来。
-        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
+        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_END; i++) {
             if (!base.isMouseUsed(i)) {
                 continue;
             }
@@ -4610,25 +4616,21 @@ public class GamepadView extends PickList {
             openList(LIST_FIX);
             return;
         }
-        // 这个种类已经在布局上了 -> 直接选中它，不重复建
-        for (int i = PadLayout.I_MOUSE_PAD; i <= PadLayout.I_MOUSE_WD; i++) {
-            if (mLayout.isMouseUsed(i)
-                    && PadLayout.protoOfType(mLayout.padType[i]) == which) {
-                clearSelection();
-                selectSingle(i);
-                computeGeometry();
-                closeList();
-                if (!mEditMode) {
-                    setEditMode(true, false);
-                }
-                toastLocal(PadLayout.mouseNameOf(which) + " 已经有了");
-                invalidate();
-                return;
-            }
-        }
-        int idx = mLayout.addMouse(which, Math.min(mW, mH) * 0.08f);
+        //
+        // 【同一种类允许建多个】
+        //   以前这里有一段"这个种类已经在布局上了 -> 直接选中它，不重复建"，
+        //   于是左键永远只能有一个 —— 想摆两个左键（左右手各一个）做不到。
+        //   现在功能按种类判（mouseKindOf），槽位只管占位置和记摆位，
+        //   所以直接建，建到第 MAX_MOUSE 个为止。
+        // 半径用和默认鼠标布局同一个算法（mousePadRadius），
+        // 不再另算一个 min(w,h)*0.08f —— 那样建出来和默认布局的
+        // 触摸板大小对不上。
+        float r = (which == PadLayout.I_MOUSE_PAD)
+                ? PadLayout.mousePadRadius(mW, mH, mH >= mW)
+                : Math.min(mW, mH) * 0.08f;
+        int idx = mLayout.addMouse(which, r);
         if (idx < 0) {
-            toastLocal("鼠标元素已达上限（" + MOUSE_CANDIDATES.length
+            toastLocal("鼠标元素已达上限（" + PadLayout.MAX_MOUSE
                     + "个），先删一个再建");
             closeList();
             invalidate();
@@ -6353,12 +6355,38 @@ public class GamepadView extends PickList {
      * 位置兜底：def 里这个槽位确实是空的（比如手柄模板上自己加的键盘键），
      * 才沿用"屏幕中间"这个约定，和 addKey() 一致。
      */
+    /**
+     * 按当前布局的模板建一份默认布局（重置单个用）。
+     *
+     * 抽出来是因为鼠标那条分支要在 def 建好**之前**就判断"模板里有没有
+     * 这个鼠标键"，而 def 本身很重（每次都要读固定显示存档），
+     * 所以只在需要时才建。
+     */
+    private PadLayout defLater() {
+        PadLayout def = new PadLayout();
+        def.reset(mW, mH, mPortrait, NO_BOTTOM_LIMIT, mTopGuard,
+                mLayout.tplOf(getContext()), getContext());
+        return def;
+    }
+
     void resetOne(int i, boolean[] dims) {
         // 【系统自带的元素不按模板默认值重置】
         //   提示牌是布局自己摆上去的，模板里根本没有它 —— 拿"空白键的默认值"
         //   （圆形 + 倍率 1）覆盖，牌子就变成正圆、文字挤成一团。
         //   G 同理。它们各自有"布局给它定的样子"，见 PadLayout.resetSysOwned。
         if (PadLayout.resetSysOwned(mLayout, i, dims)) {
+            computeGeometry();
+            mLayout.save(getContext());
+            return;
+        }
+        //
+        // 【鼠标元素不走下面那套"从 def 拷"】
+        //   def 只有在 tpl == TPL_MOUSE 时才摆鼠标元素，非鼠标布局里
+        //   它的鼠标槽位是空的：rx/ry = 0、shape = 圆、alpha = 1f。
+        //   照抄就是"触摸板飞到左上角 + 变回 100% 不透明的正圆"。
+        //   交给 resetMouseOne 按"这个种类的默认样子"恢复。
+        if (PadLayout.isMouseSlot(i) && mLayout.isMouseUsed(i)) {
+            mLayout.resetMouseOne(i, mW, mH, mPortrait, dims, defLater());
             computeGeometry();
             mLayout.save(getContext());
             return;
@@ -6971,7 +6999,7 @@ public class GamepadView extends PickList {
         */
         if (PadLayout.isMouseSlot(elem) && mLayout.isMouseUsed(elem)) {
             mDown[elem] = 1;
-            if (elem == PadLayout.I_MOUSE_PAD) {
+            if (mLayout.isMousePadAt(elem)) {
                 // 触摸板：只记起点，位移在 onMove 里按增量发
                 mMouseLastX = x;
                 mMouseLastY = y;
@@ -7277,7 +7305,7 @@ public class GamepadView extends PickList {
         */
         if (PadLayout.isMouseSlot(elem) && mLayout != null
                 && mLayout.isMouseUsed(elem)) {
-            if (elem == PadLayout.I_MOUSE_PAD) {
+            if (mLayout.isMousePadAt(elem)) {
                 int dx = Math.round((x - mMouseLastX) * MOUSE_SENS);
                 int dy = Math.round((y - mMouseLastY) * MOUSE_SENS);
                 if (dx != 0 || dy != 0) {
@@ -7372,7 +7400,7 @@ public class GamepadView extends PickList {
         if (PadLayout.isMouseSlot(elem) && mLayout != null
                 && mLayout.isMouseUsed(elem)) {
             mDown[elem] = 0;
-            if (elem == PadLayout.I_MOUSE_PAD) {
+            if (mLayout.isMousePadAt(elem)) {
                 // 双击触摸板 = 切换发送时机（测试用，好来回对比）
                 long now = System.currentTimeMillis();
                 if (!mMouseMoved && now - mMouseTapMs < 400) {

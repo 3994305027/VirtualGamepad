@@ -290,8 +290,31 @@ public final class PadLayout {
     public static final int I_MOUSE_WU = I_FLOAT + 5;
     public static final int I_MOUSE_WD = I_FLOAT + 6;
 
-    /** 数组总长：... + G + 鼠标六个 */
-    public static final int N = I_MOUSE_WD + 1;
+    /*
+      【为什么鼠标槽位可以有好几组】
+        老设计里"槽位下标 == 功能"：mouseButtonOf 只在
+        elem == I_MOUSE_L 时返回左键，于是"左键"不是一种可以放很多个的
+        种类，它就是 I_MOUSE_L 这一个槽位本身。默认鼠标布局一建就把
+        六个槽位全占满，再想建就只能返回 -1（点了没反应）。
+
+        现在功能改由**槽位里装的种类**决定（见 mouseKindOf），
+        槽位只负责"占一个位置、记住摆在哪"。于是同一种类可以建好几个，
+        比如三个左键、两块触摸板，各自摆各自的、互不干扰。
+
+      【为什么是整组追加在末尾】
+        摆位存档用下标当 key，追加在末尾则 0..I_MOUSE_WD 一个不动，
+        老存档直接兼容 —— 新的槽位只是"存档里没有这个 key"，按空处理。
+    */
+    /** 一组里有几种（触摸板 / 左 / 右 / 中 / 滚轮上 / 滚轮下）。 */
+    public static final int MOUSE_KINDS = 6;
+    /** 一共几组。3 组 = 18 个槽位。 */
+    public static final int MOUSE_BANKS = 3;
+    public static final int MAX_MOUSE = MOUSE_KINDS * MOUSE_BANKS;
+    /** 最后一个鼠标槽位的下标。 */
+    public static final int I_MOUSE_END = I_MOUSE_PAD + MAX_MOUSE - 1;
+
+    /** 数组总长：... + G + 鼠标槽位（若干组） */
+    public static final int N = I_MOUSE_END + 1;
 
     // ---- 优先级（图层顺序）----
     //
@@ -313,7 +336,9 @@ public final class PadLayout {
 
     /** 老存档没有优先级字段时，按元素种类给默认值。 */
     public static int defaultPrioOf(int i) {
-        if (i == I_MOUSE_PAD) {
+        if (isMouseSlot(i) && (i - I_MOUSE_PAD) % MOUSE_KINDS == 0) {
+            // 每一组的第 0 个都是触摸板的位置。老存档只有一组，
+            // 这里按"组内序号"判，多出来的组同样适用。
             return PRIO_MOUSE_PAD;
         }
         if (i >= BLANK_START && i < COMBO_START) {
@@ -328,9 +353,31 @@ public final class PadLayout {
         return v;
     }
 
-    /** 鼠标元素槽位：触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下 */
+    /** 鼠标元素槽位（若干组，见 MAX_MOUSE）。 */
     public static boolean isMouseSlot(int i) {
-        return i >= I_MOUSE_PAD && i <= I_MOUSE_WD;
+        return i >= I_MOUSE_PAD && i <= I_MOUSE_END;
+    }
+
+    /**
+     * 这个槽位里装的是哪一种：0=触摸板 1=左键 2=右键 3=中键 4=滚轮上 5=滚轮下。
+     * 空槽位返回 -1。
+     *
+     * 【为什么功能要按种类判，不按下标判】
+     *   按下标判的话，I_MOUSE_L 这一个槽位就等于"左键"本身，
+     *   于是全世界只能有一个左键 —— 这正是"不让创建多个"的根因。
+     *   padType 里存的就是当初建它时选的种类（typeOfElem = proto + 1），
+     *   取回来即可，不需要额外字段。
+     */
+    public int mouseKindOf(int i) {
+        if (!isMouseSlot(i) || padType[i] == 0) return -1;
+        int proto = protoOfType(padType[i]);
+        if (proto < I_MOUSE_PAD || proto > I_MOUSE_WD) return -1;
+        return proto - I_MOUSE_PAD;
+    }
+
+    /** 这个槽位装的是触摸板吗（拖动区，不是按键）。 */
+    public boolean isMousePadAt(int i) {
+        return mouseKindOf(i) == 0;
     }
 
     /** 鼠标元素的默认名字，创建 / 删除时用。 */
@@ -346,7 +393,7 @@ public final class PadLayout {
 
     /** 这个鼠标槽位是不是空的（可以往里建一个）。 */
     public int allocMouseSlot() {
-        for (int i = I_MOUSE_PAD; i <= I_MOUSE_WD; i++) {
+        for (int i = I_MOUSE_PAD; i <= I_MOUSE_END; i++) {
             if (padType[i] == 0) return i;
         }
         return -1;
@@ -355,7 +402,7 @@ public final class PadLayout {
     /** 鼠标元素还剩几个空位。 */
     public int mouseFreeCount() {
         int n = 0;
-        for (int i = I_MOUSE_PAD; i <= I_MOUSE_WD; i++) {
+        for (int i = I_MOUSE_PAD; i <= I_MOUSE_END; i++) {
             if (padType[i] == 0) n++;
         }
         return n;
@@ -1962,8 +2009,11 @@ public final class PadLayout {
             //   建出来之后立刻置 hidden —— 不然界面上标了"隐藏"，
             //   实际还是显示，等于假状态。
             java.util.Set<Integer> msH = fxLoad(ctx, tpl, "msadH");
+            float padR2 = mousePadRadius(w > 0 ? w : 1, h > 0 ? h : 1,
+                    h >= w);
             for (Integer v : fxLoad(ctx, tpl, "msadd")) {
-                int slot = addMouse(v.intValue(), defR);
+                int slot = addMouse(v.intValue(),
+                        (v.intValue() == I_MOUSE_PAD) ? padR2 : defR);
                 if (slot >= 0 && msH.contains(Integer.valueOf(v.intValue()))) {
                     hidden[slot] = true;
                 }
@@ -2723,6 +2773,25 @@ public final class PadLayout {
      *   所以先定想要的半宽半高，再反解出倍率，别直接写倍率的数
      *   —— 那样横竖屏比例一变就变形。
      */
+    /**
+     * 触摸板的半径（默认布局和创建共用同一个算法）。
+     *
+     * 【为什么要抽出来】
+     *   以前默认布局在这里算、创建走 addMouse(which, min(w,h)*0.08f)，
+     *   两套算法算出两个半径 —— 加上形状倍率也各写一套，
+     *   于是"创建的触摸板"和"默认布局的触摸板"大小完全对不上。
+     *   现在形状和半径都由这一处决定，两边必然一致。
+     */
+    public static float mousePadRadius(int w, int h, boolean portrait) {
+        float wantHW = w * (portrait ? 0.42f : 0.32f);
+        float maxHH = h * (portrait ? 0.12f : 0.20f);
+        float r = wantHW / MOUSE_PAD_W_MUL;
+        if (r * MOUSE_PAD_H_MUL > maxHH) {
+            r = maxHH / MOUSE_PAD_H_MUL;
+        }
+        return r;
+    }
+
     private void resetMouse(int w, int h, boolean portrait) {
         // ---- 触摸板 ----
         padType[I_MOUSE_PAD] = typeOfElem(I_MOUSE_PAD);
@@ -2735,12 +2804,7 @@ public final class PadLayout {
         //
         // 反过来推半径：先按屏宽定一个期望半宽，半径 = 半宽 / 3.87；
         // 再算出的半高若超过屏幕能给的，就按半高反推半径。
-        float wantHW = w * (portrait ? 0.42f : 0.32f);
-        float maxHH = h * (portrait ? 0.12f : 0.20f);
-        float padR = wantHW / MOUSE_PAD_W_MUL;
-        if (padR * MOUSE_PAD_H_MUL > maxHH) {
-            padR = maxHH / MOUSE_PAD_H_MUL;
-        }
+        float padR = mousePadRadius(w, h, portrait);
         mRadius[I_MOUSE_PAD] = padR;
         widthMul[I_MOUSE_PAD] = MOUSE_PAD_W_MUL;
         heightMul[I_MOUSE_PAD] = MOUSE_PAD_H_MUL;
@@ -2816,6 +2880,10 @@ public final class PadLayout {
         if (i < 0) return -1;
         resetMouseSlot(i, which);
         if (r > 0) mRadius[i] = r;
+        // 摆位：和空白 / 组合键一致，先放屏幕中间偏上，建完自己拖。
+        // 以前没设这两个值，新建出来会落在 0,0（左上角）看不见。
+        rx[i] = 0.5f;
+        ry[i] = 0.45f;
         return i;
     }
 
@@ -2831,13 +2899,81 @@ public final class PadLayout {
         textScale[i] = 1f;
         widthMul[i] = 1f;
         heightMul[i] = 1f;
+        // 【触摸板的形状必须引用同一组常量，不能另写一套数】
+        //   以前这里写的是 1.6f / 0.7f，而默认鼠标布局用的是
+        //   MOUSE_PAD_W_MUL(3.87) / MOUSE_PAD_H_MUL(2.30) ——
+        //   两套数字差 2~3 倍，于是"创建的触摸板"和"默认布局里的触摸板"
+        //   大小完全不一样（宽差 2.4 倍、高差 3.3 倍）。
+        //   现在两边引用同一个常量：改常量一处，两边一起变。
         if (which == I_MOUSE_PAD) {
-            widthMul[i] = 1.6f;
-            heightMul[i] = 0.7f;
+            widthMul[i] = MOUSE_PAD_W_MUL;
+            heightMul[i] = MOUSE_PAD_H_MUL;
         }
         showLabel[i] = true;
         customName[i] = mouseNameOf(which);
         prio[i] = defaultPrioOf(which);
+    }
+
+    /**
+     * 重置单个鼠标元素：恢复成"这个种类的默认样子"。
+     *
+     * 【为什么不能像别的一样从 def 里拷】
+     *   def 是按模板新建的 PadLayout，只有 tpl == TPL_MOUSE 时才会摆鼠标元素
+     *   （见 reset() 里那段）。在非鼠标布局里 def 的鼠标槽位是空的：
+     *     rx / ry = 0       -> 位置被写成 (0,0)，按钮飞到左上角
+     *     shape  = 圆形     -> 触摸板的长方形变回正圆
+     *     alpha  = 1f       -> 触摸板的 50% 半透明变成完全不透明
+     *     widthMul/heightMul = 1 -> 3.87 / 2.30 的倍率丢失
+     *   这四条正好就是"重置单个触摸板"之后看到的全部症状。
+     *
+     * 【位置怎么办】
+     *   模板里真有这个键（def.padType[i] != 0）才照模板摆；
+     *   没有就**保持原位** —— 重置的语义是"恢复成默认的样子"，
+     *   不是"挪到不存在的默认位置"。
+     */
+    public void resetMouseOne(int i, int w, int h, boolean portrait,
+                              boolean[] dims, PadLayout def) {
+        if (!isMouseSlot(i) || padType[i] == 0) {
+            return;
+        }
+        int which = protoOfType(padType[i]);
+        if (which < I_MOUSE_PAD || which > I_MOUSE_WD) {
+            return;
+        }
+        boolean inDef = (def != null && def.padType[i] != 0);
+        if (dims[0]) {          // RD_POS
+            if (inDef) {
+                rx[i] = def.rx[i];
+                ry[i] = def.ry[i];
+            } else {
+                //
+                // 【模板里没有也要重置，不能"保持原位"】
+                //   用户勾了「位置」就是要位置变。而 def 只在
+                //   tpl == TPL_MOUSE 时才摆鼠标元素 —— 在非鼠标布局里
+                //   创建的鼠标键，def 的对应槽位是空的，照 def 拷就是
+                //   写 0（飞到左上角），保持原位又是"点了没反应"。
+                //   折中：回到**创建时的默认位置** 0.5 / 0.45，
+                //   和 addMouse / addKey 一致 —— 那才是这类键的"默认"。
+                rx[i] = 0.5f;
+                ry[i] = 0.45f;
+            }
+        }
+        if (dims[1]) {          // RD_SIZE
+            scale[i] = inDef ? def.scale[i] : 1f;
+        }
+        if (dims[2]) {          // RD_ALPHA
+            alpha[i] = (which == I_MOUSE_PAD) ? MOUSE_PAD_ALPHA : 1f;
+        }
+        if (dims[3]) {          // RD_TEXT
+            textScale[i] = 1f;
+        }
+        if (dims[4]) {          // RD_OTHER
+            // 形状 / 倍率 / 名字 / 优先级 / 显隐 全按种类默认
+            resetMouseSlot(i, which);
+            if (which == I_MOUSE_PAD) {
+                mRadius[i] = mousePadRadius(w, h, portrait);
+            }
+        }
     }
 
     /** 删掉一个鼠标元素，槽位回收（padType 归 0）。 */

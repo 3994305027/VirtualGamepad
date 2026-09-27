@@ -885,10 +885,21 @@ abstract class PickList extends View {
             if (!mListSel[i] || !isDeletable(i)) {
                 continue;
             }
+            //
+            // 【组合键 / 鼠标也要有分支，不能落进 removePad】
+            //   removePad 开头是 if (!isPadSlot(i)) return; —— 而组合键和
+            //   鼠标槽位都不在手柄槽位区间里，于是直接 return，什么都不做。
+            //   表现就是"勾上了、点了确定、按钮还在"，跟没删一样。
+            //   单个删除（DLG_CONFIRM_DEL_KEY）那边分支是齐的，
+            //   批量这条漏了 —— 两边必须一起看。
             if (PadLayout.isKeySlot(i)) {
                 mLayout.removeKey(i);
             } else if (PadLayout.isBlankSlot(i)) {
                 mLayout.removeBlank(i);
+            } else if (PadLayout.isComboSlot(i)) {
+                mLayout.removeCombo(i);
+            } else if (PadLayout.isMouseSlot(i)) {
+                mLayout.removeMouse(i);
             } else {
                 mLayout.removePad(i);
             }
