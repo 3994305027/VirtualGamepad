@@ -89,7 +89,33 @@ jobs:
             "platforms;android-33" "build-tools;30.0.3" "build-tools;33.0.1" "platform-tools" \
             || "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
                  "platforms;android-33" "build-tools;30.0.3" "build-tools;33.0.1" "platform-tools"
-          ls -d "$ANDROID_HOME/platforms/android-33" "$ANDROID_HOME/build-tools/30.0.3" 2>&1 || true
+          ls -d "$ANDROID_HOME/platforms/android-33" "$ANDROID_HOME/build-tools/30.0.3" \
+                "$ANDROID_HOME/build-tools/33.0.1" 2>&1 || true
+
+      # 【把 dx 补进 build-tools 33.0.1】
+      # 31.0.0 起 Google 删了 dx，但 AGP 4.1.0 仍有任务要调它，
+      # 直接降 build-tools 到 30.0.3 会让 aapt2 也跟着变旧（30.0.3 的 aapt2
+      # 去编 compileSdk 33 的资源/manifest，产物与本地口径不一致）。
+      # 所以反过来：保留 33.0.1（aapt2 是新的），只把 30.0.3 的 dx 拷进来。
+      - name: Restore dx into build-tools 33.0.1
+        run: |
+          set -e
+          AH="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SRC="$AH/build-tools/30.0.3"
+          DST="$AH/build-tools/33.0.1"
+          if [ ! -d "$SRC" ]; then
+            echo "::warning::没有 30.0.3，拿不到 dx，跳过"; exit 0
+          fi
+          mkdir -p "$DST"
+          for f in dx dx.jar; do
+            if [ -e "$SRC/$f" ] && [ ! -e "$DST/$f" ]; then
+              cp -a "$SRC/$f" "$DST/$f" && echo "已补 $f"
+            fi
+          done
+          if [ -d "$SRC/lib/dx.jar" ] && [ ! -e "$DST/lib/dx.jar" ]; then
+            mkdir -p "$DST/lib"; cp -a "$SRC/lib/dx.jar" "$DST/lib/dx.jar" && echo "已补 lib/dx.jar"
+          fi
+          ls -l "$DST/dx" "$DST/dx.jar" 2>&1 || true
 
       - name: Set up JDK 11 (for Gradle 6.7.1)
         uses: actions/setup-java@v4
@@ -295,19 +321,58 @@ jobs:
             || echo "::error::gradle projects 里没有 :app —— settings.gradle 仍未生效"
 
       # 不用 --stacktrace：它会打出几百行堆栈，把整个 job 日志撑到被 GitHub 截断
+      #
+      # 【-PactionsBuild】
+      #   app/build.gradle 里写了：有这个参数就给包名加 .actions 后缀，
+      #   编出来是 com.example.vgamepad.actions，能和正式版共存安装。
+      #   manifest 里 Shizuku 的 authority 用的是 ${applicationId}.shizuku 占位符，
+      #   会自动跟着变成 com.example.vgamepad.actions.shizuku，
+      #   两版各注册各的，不抢同一个 authority，Shizuku 都认得出来。
       - name: Build Debug APK
         run: |
           set -eo pipefail
           cd "$PROJECT_DIR"
-          ./gradlew :app:assembleDebug --no-daemon 2>&1 \
+          ./gradlew :app:assembleDebug -PactionsBuild --no-daemon 2>&1 \
             | tee "$GITHUB_WORKSPACE/gradle-debug.log"
 
       - name: Build Release APK
         run: |
           set -eo pipefail
           cd "$PROJECT_DIR"
-          ./gradlew :app:assembleRelease --no-daemon 2>&1 \
+          ./gradlew :app:assembleRelease -PactionsBuild --no-daemon 2>&1 \
             | tee "$GITHUB_WORKSPACE/gradle-release.log"
+
+      # 【诊断】Shizuku 认不出本 app 时，先确认两件事：
+      #   ① APK 的 manifest 里到底有没有 rikka.shizuku.ShizukuProvider
+      #   ② dex 里到底有没有这个类（声明在但类不在 = provider 实例化不了）
+      - name: Inspect debug APK for Shizuku provider
+        run: |
+          set -e
+          AH="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APK=$(find "$GITHUB_WORKSPACE/apks" -name "*.apk" 2>/dev/null | head -1)
+          [ -n "$APK" ] || APK=$(find "$GITHUB_WORKSPACE" -path "*/outputs/apk/debug/*.apk" | head -1)
+          DIAG="$GITHUB_WORKSPACE/diag.txt"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::warning::没找到 APK，跳过体检"; exit 0
+          fi
+          echo "===== APK: $APK =====" | tee -a "$DIAG"
+          AAPT2=$(ls "$AH"/build-tools/*/aapt2 2>/dev/null | sort -r | head -1)
+          if [ -n "$AAPT2" ]; then
+            echo "----- providers (aapt2 badging) -----" | tee -a "$DIAG"
+            "$AAPT2" dump badging "$APK" 2>/dev/null \
+              | grep -i "provider\|uses-permission: name='moe\|package: name" | tee -a "$DIAG" || true
+            echo "----- 原始 manifest 里的 provider 段 -----" | tee -a "$DIAG"
+            "$AAPT2" dump xmltree "$APK" AndroidManifest.xml 2>/dev/null \
+              | grep -n -A6 "ShizukuProvider" | head -30 | tee -a "$DIAG" || true
+          fi
+          echo "----- dex 里有没有 ShizukuProvider 类 -----" | tee -a "$DIAG"
+          for d in classes.dex classes2.dex; do
+            if unzip -p "$APK" "$d" 2>/dev/null | strings | grep -q "rikka/shizuku/ShizukuProvider"; then
+              echo "$d: 有 rikka/shizuku/ShizukuProvider  ✓" | tee -a "$DIAG"
+            fi
+          done
+          echo "----- APK 内 Shizuku 相关条目 -----" | tee -a "$DIAG"
+          unzip -l "$APK" | grep -i "shizuku" | head -20 | tee -a "$DIAG" || true
 
       - name: Collect APKs
         run: |
