@@ -36,28 +36,85 @@ jobs:
           distribution: temurin
           java-version: '11'
 
-      # GitHub 的 ubuntu 镜像只预装了一部分 SDK，
-      # 本项目 compileSdk 33 / buildTools 33.0.1，得显式装。
-      # 新镜像用 cmdline-tools，老镜像用 tools，两个路径都找一遍。
+      # 先打一份环境诊断。这一步永不失败，失败时要靠它定位。
+      - name: Print SDK diagnostics
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-<empty>}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<empty>}"
+          echo "--- ls \$ANDROID_HOME ---"
+          ls -la "${ANDROID_HOME:-/usr/local/lib/android/sdk}" 2>&1 | head -30 || true
+          echo "--- ls cmdline-tools ---"
+          ls -la "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" 2>&1 | head -20 || true
+          echo "--- 已装的 platforms ---"
+          ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}/platforms" 2>&1 | head -20 || true
+          echo "--- 已装的 build-tools ---"
+          ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" 2>&1 | head -20 || true
+          echo "--- JAVA_HOME / java 版本 ---"
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version 2>&1 || true
+
+      # 【为什么这一步写这么长】
+      #   上一版在这里直接 exit 1（找不到 sdkmanager 就报错），整个 job 9 秒就挂了。
+      #   现在改成三级兜底：先找现成的 → 再 glob 任意版本 → 最后自己下载
+      #   commandlinetools。同时"已经装过就跳过"，避免无谓下载。
       - name: Install Android SDK packages
         run: |
           set -e
+
+          # ① 定 ANDROID_HOME：三个来源，都没有就用镜像默认路径
+          SDKROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [ -n "$SDKROOT" ] || SDKROOT=/usr/local/lib/android/sdk
+          export ANDROID_HOME="$SDKROOT"
+          export ANDROID_SDK_ROOT="$SDKROOT"
+          echo "使用 SDK 根目录: $ANDROID_HOME"
+
+          # ② 已经装齐就跳过（镜像常常已经带了 platform 33）
+          if [ -d "$ANDROID_HOME/platforms/android-33" ] \
+             && [ -d "$ANDROID_HOME/build-tools/33.0.1" ]; then
+            echo "platforms;android-33 与 build-tools;33.0.1 已存在，跳过安装"
+            exit 0
+          fi
+
+          # ③ 找 sdkmanager：latest → 任意版本号 → 老式 tools
           SDKMANAGER=""
           for p in \
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/cmdline-tools/bin/sdkmanager" \
+            $(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -r | head -3) \
             "$ANDROID_HOME/tools/bin/sdkmanager" ; do
-            if [ -x "$p" ]; then SDKMANAGER="$p"; break; fi
+            if [ -n "$p" ] && [ -x "$p" ]; then SDKMANAGER="$p"; break; fi
           done
+
+          # ④ 都没有就自己下一份 commandlinetools
           if [ -z "$SDKMANAGER" ]; then
-            echo "::error::找不到 sdkmanager，请检查 runner 镜像"
-            exit 1
+            echo "镜像里没有 sdkmanager，自行下载 commandlinetools"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -sSL --retry 3 -o /tmp/cmdtools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q -o /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+            # 新版解压出来是 cmdline-tools/bin，要挪成 cmdline-tools/latest/bin
+            if [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ]; then
+              rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            fi
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           fi
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-          "$SDKMANAGER" --install \
+          [ -x "$SDKMANAGER" ] || { echo "::error::仍然找不到 sdkmanager: $SDKMANAGER"; exit 1; }
+          chmod +x "$SDKMANAGER" 2>/dev/null || true
+          echo "sdkmanager: $SDKMANAGER"
+
+          # ⑤ 装包。--sdk_root 必须显式给，否则新版 sdkmanager 可能装到别的目录
+          yes | "$SDKMANAGER" --licenses --sdk_root="$ANDROID_HOME" >/dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "platforms;android-33" \
             "build-tools;33.0.1" \
-            "platform-tools"
+            "platform-tools" \
+            || "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
+                 "platforms;android-33" "build-tools;33.0.1" "platform-tools"
+
+          # ⑥ 装完复查，没装到就直接报出来
+          ls -d "$ANDROID_HOME/platforms/android-33" \
+                "$ANDROID_HOME/build-tools/33.0.1" 2>&1 || true
 
       - name: Cache Gradle
         uses: actions/cache@v4
