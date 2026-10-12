@@ -1,10 +1,14 @@
 name: Build APK
 
 # 触发时机：
-#   push 到 main/master      → 编译并上传 APK 压缩包
+#   push 到 main/master      → 编译并上传 APK
 #   push tag（v* 开头）      → 额外自动建一个 Release
 #   pull request             → 只编译，验证能不能过
 #   手动（Actions 页面点 Run）→ 随时可跑
+#
+# 【排障约定】整个 job 的日志很容易被 GitHub 截断（上版就是被 --stacktrace
+# 撑爆的）。所以关键结论一律用 ::error:: / ::warning:: 推到页面顶部的
+# Annotations 区 —— 不用展开任何步骤就能看到原因。多行用 %0A 连接。
 on:
   push:
     branches: [ "main", "master" ]
@@ -18,7 +22,7 @@ jobs:
     name: Assemble APK
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 打 tag 时要建 Release，需要写权限
+      contents: write
 
     env:
       GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"
@@ -27,7 +31,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 新版 sdkmanager 必须跑在 JDK 17（class 61），Gradle 6.7.1 又不能跑在
+      # 新版 sdkmanager 必须 JDK 17（class 61），Gradle 6.7.1 又不能跑在
       # JDK 17 上。所以装两个：17 装 SDK，11 编 Gradle。顺序不能反。
       - name: Set up JDK 17 (for sdkmanager)
         uses: actions/setup-java@v4
@@ -41,10 +45,10 @@ jobs:
           SDKROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           [ -n "$SDKROOT" ] || SDKROOT=/usr/local/lib/android/sdk
           export ANDROID_HOME="$SDKROOT"; export ANDROID_SDK_ROOT="$SDKROOT"
-          echo "使用 SDK 根目录: $ANDROID_HOME"
+          echo "SDK 根目录: $ANDROID_HOME"
           if [ -d "$ANDROID_HOME/platforms/android-33" ] \
              && [ -d "$ANDROID_HOME/build-tools/33.0.1" ]; then
-            echo "已存在，跳过安装"; exit 0
+            echo "SDK 已齐，跳过安装"; exit 0
           fi
           JAVA_MAJOR=$(java -version 2>&1 | awk -F'"' '/version/{print $2}' \
                        | awk -F'.' '{print ($1=="1")?$2:$1}')
@@ -93,75 +97,84 @@ jobs:
           distribution: temurin
           java-version: '11'
 
-      # 【核心：不再假定 settings.gradle 一定对】
-      # 症状：Task 'assembleDebug' not found in root project 'VirtualGamepad'
-      # 含义：Gradle 只加载了根工程，:app 模块根本没进构建 ——
-      #   可能 settings.gradle 缺失 / 不在工作目录 / 内容是空的 /
-      #   带 BOM / 只有 CRLF 没内容 / include 的不是 ':app'。
-      # 这里逐字节查（cat -A 能看出 BOM 的 M-oM-;M-? 和换行的 ^M$），
-      # 查完不合格就直接重写一份，不靠仓库里那份。
+      # 【核心自愈】症状：Task 'assembleDebug' not found in root project 'xxx'
+      # 含义：Gradle 只加载了根工程，:app 没进构建。可能原因：
+      #   settings.gradle 缺失 / 不在工作目录 / 0 字节 / 带 BOM /
+      #   不含 include / include 的不是 ':app' /
+      #   app/build.gradle 缺失或没 apply com.android.application（没这个插件
+      #   就没有 assembleDebug 任务，报错长得一模一样）
+      # 这里逐项体检，不合格当场重写，并把结论写进 DIAG 供最后汇总。
       - name: Locate and normalize project root
         run: |
           set -e
           WS="$GITHUB_WORKSPACE"
-          echo "===== 仓库根一览 ====="
-          ls -la "$WS" | head -40
-          echo "===== 全仓 find（.gradle/.git 除外，深度 6）====="
+          DIAG="$GITHUB_WORKSPACE/diag.txt"
+          : > "$DIAG"
+
+          echo "===== 仓库根 =====" | tee -a "$DIAG"
+          ls -A "$WS" | head -30 | tee -a "$DIAG"
+
+          echo "===== 全仓 find gradle 文件（深度 6）=====" | tee -a "$DIAG"
           find "$WS" -maxdepth 6 -not -path '*/.git/*' -not -path '*/.gradle/*' \
             \( -name 'settings.gradle*' -o -name 'build.gradle*' -o -name 'gradlew' \) \
-            -print 2>/dev/null | head -40
-          echo "===== 所有叫 app 的目录 ====="
-          find "$WS" -maxdepth 6 -type d -name app -not -path '*/.git/*' -print 2>/dev/null | head -10
+            -print 2>/dev/null | head -20 | tee -a "$DIAG"
 
-          # ① 找工程根：优先「根上有 settings.gradle + app」，
-          #    否则找「有 app 目录」的最浅一层
+          echo "===== app 目录 =====" | tee -a "$DIAG"
+          APPS=$(find "$WS" -maxdepth 6 -type d -name app -not -path '*/.git/*' \
+                 -printf '%d %p\n' 2>/dev/null | sort -n | head -5)
+          echo "${APPS:-(无)}" | tee -a "$DIAG"
+
+          # ① 定位工程根：优先根上有 app，否则取最浅的 app 的父目录
           PROJ=""
           if [ -d "$WS/app" ]; then PROJ="$WS"; fi
           if [ -z "$PROJ" ]; then
-            PROJ=$(find "$WS" -maxdepth 6 -type d -name app -not -path '*/.git/*' \
-                   -printf '%d %p\n' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-)
-            [ -n "$PROJ" ] && PROJ=$(dirname "$PROJ")
+            D=$(echo "$APPS" | head -1 | cut -d' ' -f2-)
+            [ -n "$D" ] && PROJ=$(dirname "$D")
           fi
-          [ -n "$PROJ" ] || { echo "::error::找不到 app 目录"; find "$WS" -maxdepth 3 | head -60; exit 1; }
-          echo "工程根目录: $PROJ"
+          if [ -z "$PROJ" ]; then
+            echo "::error::仓库里找不到 app 目录%0A$(echo "$APPS" | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
           echo "PROJECT_DIR=$PROJ" >> "$GITHUB_ENV"
+          echo "工程根目录: $PROJ" | tee -a "$DIAG"
 
-          # ② 逐字节体检 settings.gradle
-          echo "===== settings.gradle 体检 ====="
+          # ② settings.gradle 逐字节体检（cat -A 能看出 BOM 的 M-oM-;M-? 与 ^M$）
           SG="$PROJ/settings.gradle"
+          echo "===== settings.gradle 体检 =====" | tee -a "$DIAG"
           if [ -f "$SG" ]; then
-            echo "文件大小: $(wc -c < "$SG") 字节"
-            echo "--- cat -A（显 BOM / 换行）---"
-            cat -A "$SG" | head -20
-            echo "--- 是否含 include ---"
-            grep -c "include" "$SG" || echo "0 处 include"
+            echo "大小: $(wc -c < "$SG") 字节" | tee -a "$DIAG"
+            echo "cat -A: $(cat -A "$SG" | head -5 | tr '\n' '|')" | tee -a "$DIAG"
+            echo "include 数: $(grep -c include "$SG" || true)" | tee -a "$DIAG"
           else
-            echo "settings.gradle 不存在"
+            echo "settings.gradle 不存在" | tee -a "$DIAG"
           fi
 
-          # ③ 不合格就重写：没文件 / 体积 < 5 字节 / 不含 include ':app'
+          # ③ 不合格就重写（printf 写，避免 Windows 编辑器再引入 BOM）
           NEED=0
           if [ ! -f "$SG" ]; then NEED=1
           elif [ "$(wc -c < "$SG")" -lt 5 ]; then NEED=1
           elif ! grep -q "include" "$SG"; then NEED=1
           fi
           if [ "$NEED" = "1" ]; then
-            echo "::warning::settings.gradle 不合格，自动重写"
-            # 去掉可能的 BOM，用 printf 写纯 ASCII，避免 Windows 编辑器再引入 BOM
+            echo "::warning::settings.gradle 不合格，已自动重写为 include ':app'"
             printf "include ':app'\n" > "$SG"
             chmod 644 "$SG"
+            echo "重写后: $(cat -A "$SG" | tr '\n' '|')" | tee -a "$DIAG"
           fi
-          echo "--- 最终 settings.gradle（cat -A）---"
-          cat -A "$SG"
 
-          # ④ app/build.gradle 必须在，且要认得出是 Android 应用模块
-          echo "===== app/build.gradle 体检 ====="
-          if [ ! -f "$PROJ/app/build.gradle" ]; then
+          # ④ app/build.gradle 必须在，且必须有 Android 应用插件
+          echo "===== app/build.gradle 体检 =====" | tee -a "$DIAG"
+          BG="$PROJ/app/build.gradle"
+          if [ ! -f "$BG" ]; then
             echo "::error::app/build.gradle 不存在"
-            ls -la "$PROJ/app" | head -30
+            ls -A "$PROJ/app" | head -20 | tee -a "$DIAG"
             exit 1
           fi
-          head -5 "$PROJ/app/build.gradle"
+          echo "大小: $(wc -c < "$BG") 字节" | tee -a "$DIAG"
+          head -8 "$BG" | tee -a "$DIAG"
+          if ! grep -q "com.android.application" "$BG"; then
+            echo "::error::app/build.gradle 里没有 com.android.application —— 没有这个插件就没有 assembleDebug 任务"
+          fi
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -177,39 +190,42 @@ jobs:
         run: |
           set -e
           cd "$PROJECT_DIR"
-          test -f ./gradlew || { echo "::error::gradlew 不存在"; ls -la . | head -30; exit 1; }
+          test -f ./gradlew || { echo "::error::gradlew 不存在"; exit 1; }
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
-            echo "::error::gradle-wrapper.jar 不存在"
+            echo "::error::gradle-wrapper.jar 不存在 —— 没有它 Gradle 起不来"
           else
             unzip -l gradle/wrapper/gradle-wrapper.jar 2>/dev/null | grep -i GradleWrapperMain \
-              || echo "::warning::jar 里没有 GradleWrapperMain"
+              >/dev/null || echo "::error::jar 里没有 GradleWrapperMain（jar 损坏）"
             grep distributionUrl gradle/wrapper/gradle-wrapper.properties
           fi
           chmod +x ./gradlew
 
-      # 允许失败：只为排障。正常应看到 Root project + Project ':app'
+      # 允许失败，只为排障。正常输出应含 Root project + Project ':app'
       - name: Gradle projects sanity check
         continue-on-error: true
         run: |
           cd "$PROJECT_DIR"
-          ./gradlew projects 2>&1 | tee "$GITHUB_WORKSPACE/gradle-projects.log"
-          echo "退出码: ${PIPESTATUS[0]}"
-          echo "--- 有没有 :app ---"
-          grep -n "':app'" "$GITHUB_WORKSPACE/gradle-projects.log" || echo "未出现 :app"
+          ./gradlew projects > "$GITHUB_WORKSPACE/gradle-projects.log" 2>&1 \
+            || echo "gradlew projects 退出码非零"
+          grep -E "Root project|Project '|FAILURE|What went wrong" \
+            "$GITHUB_WORKSPACE/gradle-projects.log" | head -10
+          grep -q "':app'" "$GITHUB_WORKSPACE/gradle-projects.log" \
+            && echo "检测到 :app 模块" \
+            || echo "::error::gradle projects 里没有 :app —— settings.gradle 仍未生效"
 
-      # 显式指定 :app，模块没进去会立刻报得更清楚
+      # 不用 --stacktrace：它会打出几百行堆栈，把整个 job 日志撑到被 GitHub 截断
       - name: Build Debug APK
         run: |
           set -eo pipefail
           cd "$PROJECT_DIR"
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace 2>&1 \
+          ./gradlew :app:assembleDebug --no-daemon 2>&1 \
             | tee "$GITHUB_WORKSPACE/gradle-debug.log"
 
       - name: Build Release APK
         run: |
           set -eo pipefail
           cd "$PROJECT_DIR"
-          ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 \
+          ./gradlew :app:assembleRelease --no-daemon 2>&1 \
             | tee "$GITHUB_WORKSPACE/gradle-release.log"
 
       - name: Collect APKs
@@ -221,22 +237,25 @@ jobs:
           cp -v "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk apks/release/ 2>&1 || true
           find apks -type f -name '*.apk' -print
 
-      - name: Dump failure logs
+      # 【关键】把结论推到页面顶部 Annotations，不用展开任何巨型日志
+      - name: Summarize failure
         if: failure()
         run: |
-          cd "$GITHUB_WORKSPACE" 2>/dev/null || true
-          echo "===== gradle-projects.log ====="
-          head -n 50 gradle-projects.log 2>/dev/null || echo "(无)"
-          echo "===== gradle-debug.log 末 200 行 ====="
-          tail -n 200 gradle-debug.log 2>/dev/null || echo "(无)"
-          echo "===== daemon 日志 ====="
-          for f in "$HOME"/.gradle/daemon/*/daemon-*.log; do
-            [ -f "$f" ] || continue; echo "--- $f ---"; tail -n 60 "$f"
-          done
-          echo "===== 错误行汇总 ====="
-          grep -n -i -E "error:|FAILED|What went wrong|Caused by" \
-            gradle-debug.log gradle-release.log gradle-projects.log 2>/dev/null | head -60 \
-            || echo "(未匹配到)"
+          cd "$GITHUB_WORKSPACE"
+          {
+            echo "===== settings.gradle ====="
+            cat "$PROJECT_DIR/settings.gradle" 2>/dev/null || echo "(无)"
+            echo "===== app 目录前 20 项 ====="
+            ls -A "$PROJECT_DIR/app" 2>/dev/null | head -20
+            echo "===== app/build.gradle 前 12 行 ====="
+            head -12 "$PROJECT_DIR/app/build.gradle" 2>/dev/null || echo "(无)"
+            echo "===== gradle projects 关键行 ====="
+            grep -E "Root project|Project '|What went wrong" gradle-projects.log 2>/dev/null | head -10
+            echo "===== gradle-debug.log 末 25 行 ====="
+            tail -n 25 gradle-debug.log 2>/dev/null || echo "(无)"
+          } > summary.txt 2>&1
+          # 多行转成 %0A，塞进 annotation（页面顶部直接可见）
+          echo "::error::$(sed ':a;N;$!ba;s/\n/%0A/g' summary.txt)"
 
       - name: Upload failure logs
         if: failure()
@@ -244,14 +263,14 @@ jobs:
         with:
           name: build-logs
           path: |
+            summary.txt
+            diag.txt
             gradle-debug.log
             gradle-release.log
             gradle-projects.log
           if-no-files-found: ignore
 
       # —— 可选：正式签名 ——
-      # 不配 secrets 就整段跳过。
-      # Settings → Secrets 加四个：KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
       # 【为什么不在 if: 里判断 secrets】step 的 if: 读不到 secrets 上下文，
       # 写了会 Invalid workflow file，整个工作流跑不起来。所以判断放 shell。
       - name: Sign release APK
