@@ -88,8 +88,11 @@ jobs:
       #   KEYSTORE_PASSWORD    密钥库密码
       #   KEY_ALIAS            别名
       #   KEY_PASSWORD         别名密码
+      # 【为什么不在 if: 里判断 secrets】
+      #   step 的 if: 条件里**读不到 secrets 上下文**，写了会直接
+      #   Invalid workflow file（Unrecognized named-value: 'secrets'），
+      #   整个工作流连跑都跑不起来。所以判断放到 shell 里做。
       - name: Sign release APK
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -97,6 +100,11 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -e
+          # 没配 secrets 时 env 是空串，这里自己退出，等同原来的 if。
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "未配置签名 secrets，跳过签名（release 仍是 unsigned，仅留档）"
+            exit 0
+          fi
           BT="$ANDROID_HOME/build-tools/33.0.1"
           [ -d "$BT" ] || BT="$ANDROID_SDK_ROOT/build-tools/33.0.1"
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
