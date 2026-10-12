@@ -1,0 +1,19 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:4.1.0'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        // 不需要 maven.rikka.app —— 实测 google() + mavenCentral() 就能拉到
+        // dev.rikka.shizuku 的 13.1.5。多加一个访问不了的仓库只会拖慢构建。
+        // 注意：12.2.0 在这两个源上拉不到，别再退回那个版本。
+    }
+}
