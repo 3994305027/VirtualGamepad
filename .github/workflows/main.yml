@@ -21,141 +21,147 @@ jobs:
       contents: write   # 打 tag 时要建 Release，需要写权限
 
     env:
-      # gradle.properties 里写的是 -Xmx1024m，CI 上偏小容易 OOM，这里覆盖
       GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 【为什么先装 JDK 17】
-      #   实测报错：
-      #     UnsupportedClassVersionError: SdkManagerCli has been compiled by a
-      #     more recent version of the Java Runtime (class file version 61.0),
-      #     this version ... only recognizes ... up to 55.0
-      #   class 61 = Java 17，class 55 = Java 11。
-      #   也就是新版 sdkmanager **必须**跑在 JDK 17 上，JDK 11 起不来。
-      #   但 Gradle 6.7.1 又**不能**跑在 JDK 17 上（会报 Unsupported class
-      #   file major version 61）。所以这里要装两个 JDK：
-      #     · 装 SDK 用 17
-      #     · 编译用 11
-      #   顺序不能反 —— setup-java 后一次会覆盖 JAVA_HOME。
+      # 新版 sdkmanager 必须跑在 JDK 17（class 61），Gradle 6.7.1 又不能跑在
+      # JDK 17 上。所以装两个：17 装 SDK，11 编 Gradle。顺序不能反。
       - name: Set up JDK 17 (for sdkmanager)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 先打一份环境诊断。这一步永不失败，失败时要靠它定位。
-      - name: Print SDK diagnostics
-        run: |
-          echo "ANDROID_HOME=${ANDROID_HOME:-<empty>}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<empty>}"
-          echo "--- ls \$ANDROID_HOME ---"
-          ls -la "${ANDROID_HOME:-/usr/local/lib/android/sdk}" 2>&1 | head -30 || true
-          echo "--- ls cmdline-tools ---"
-          ls -la "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" 2>&1 | head -20 || true
-          echo "--- 已装的 platforms ---"
-          ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}/platforms" 2>&1 | head -20 || true
-          echo "--- 已装的 build-tools ---"
-          ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" 2>&1 | head -20 || true
-          echo "--- JAVA_HOME / java 版本 ---"
-          echo "JAVA_HOME=$JAVA_HOME"
-          java -version 2>&1 || true
-          echo "--- /usr/lib/jvm 里可用的 JDK ---"
-          ls -1 /usr/lib/jvm 2>&1 | head -20 || true
-
-      # 【为什么这一步写这么长】
-      #   上一版在这里直接 exit 1（找不到 sdkmanager 就报错），整个 job 9 秒就挂了。
-      #   现在改成三级兜底：先找现成的 → 再 glob 任意版本 → 最后自己下载
-      #   commandlinetools。同时"已经装过就跳过"，避免无谓下载。
       - name: Install Android SDK packages
         run: |
           set -e
-
-          # ① 定 ANDROID_HOME：三个来源，都没有就用镜像默认路径
           SDKROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           [ -n "$SDKROOT" ] || SDKROOT=/usr/local/lib/android/sdk
-          export ANDROID_HOME="$SDKROOT"
-          export ANDROID_SDK_ROOT="$SDKROOT"
+          export ANDROID_HOME="$SDKROOT"; export ANDROID_SDK_ROOT="$SDKROOT"
           echo "使用 SDK 根目录: $ANDROID_HOME"
-
-          # ② 已经装齐就跳过（镜像常常已经带了 platform 33）
           if [ -d "$ANDROID_HOME/platforms/android-33" ] \
              && [ -d "$ANDROID_HOME/build-tools/33.0.1" ]; then
-            echo "platforms;android-33 与 build-tools;33.0.1 已存在，跳过安装"
-            exit 0
+            echo "已存在，跳过安装"; exit 0
           fi
-
-          # ③ 确认 java 是 17+（sdkmanager 的硬性要求）
-          #    万一上一步 setup-java 没生效，就在 /usr/lib/jvm 里找一个
           JAVA_MAJOR=$(java -version 2>&1 | awk -F'"' '/version/{print $2}' \
                        | awk -F'.' '{print ($1=="1")?$2:$1}')
-          echo "当前 java 主版本: ${JAVA_MAJOR:-未知}"
+          echo "java 主版本: ${JAVA_MAJOR:-未知}"
           if [ -z "$JAVA_MAJOR" ] || [ "$JAVA_MAJOR" -lt 17 ] 2>/dev/null; then
             for j in /usr/lib/jvm/*17* /usr/lib/jvm/*21*; do
               if [ -x "$j/bin/java" ]; then
-                export JAVA_HOME="$j"
-                export PATH="$j/bin:$PATH"
-                echo "改用 $JAVA_HOME"
-                break
+                export JAVA_HOME="$j"; export PATH="$j/bin:$PATH"
+                echo "改用 $JAVA_HOME"; break
               fi
             done
           fi
-          java -version 2>&1 || true
-
-          # ④ 找 sdkmanager：latest → 任意版本号 → 老式 tools
           SDKMANAGER=""
           for p in \
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "$ANDROID_HOME/cmdline-tools/bin/sdkmanager" \
             $(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -r | head -3) \
             "$ANDROID_HOME/tools/bin/sdkmanager" ; do
-            if [ -n "$p" ] && [ -x "$p" ]; then SDKMANAGER="$p"; break; fi
+            [ -n "$p" ] && [ -x "$p" ] && { SDKMANAGER="$p"; break; }
           done
-
-          # ⑤ 都没有就自己下一份 commandlinetools
           if [ -z "$SDKMANAGER" ]; then
-            echo "镜像里没有 sdkmanager，自行下载 commandlinetools"
+            echo "自行下载 commandlinetools"
             mkdir -p "$ANDROID_HOME/cmdline-tools"
             curl -sSL --retry 3 -o /tmp/cmdtools.zip \
               https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
             unzip -q -o /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
-            # 新版解压出来是 cmdline-tools/bin，要挪成 cmdline-tools/latest/bin
             if [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ]; then
               rm -rf "$ANDROID_HOME/cmdline-tools/latest"
               mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
             fi
             SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           fi
-          [ -x "$SDKMANAGER" ] || { echo "::error::仍然找不到 sdkmanager: $SDKMANAGER"; exit 1; }
+          [ -x "$SDKMANAGER" ] || { echo "::error::找不到 sdkmanager"; exit 1; }
           chmod +x "$SDKMANAGER" 2>/dev/null || true
-          echo "sdkmanager: $SDKMANAGER"
-
-          # ⑥ 装包。--sdk_root 必须显式给，否则新版 sdkmanager 可能装到别的目录
-          printf 'y\ny\ny\ny\ny\ny\ny\ny\ny\ny\n' \
+          printf 'y\ny\ny\ny\ny\n' \
             | "$SDKMANAGER" --licenses --sdk_root="$ANDROID_HOME" >/dev/null 2>&1 || true
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
-            "platforms;android-33" \
-            "build-tools;33.0.1" \
-            "platform-tools" \
+            "platforms;android-33" "build-tools;33.0.1" "platform-tools" \
             || "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
                  "platforms;android-33" "build-tools;33.0.1" "platform-tools"
+          ls -d "$ANDROID_HOME/platforms/android-33" "$ANDROID_HOME/build-tools/33.0.1" 2>&1 || true
 
-          # ⑦ 装完复查，没装到就直接报出来
-          ls -d "$ANDROID_HOME/platforms/android-33" \
-                "$ANDROID_HOME/build-tools/33.0.1" 2>&1 || true
-
-      # 【为什么这里切回 JDK 11】
-      #   Gradle 6.7.1 在 JDK 17 上会报 Unsupported class file major
-      #   version 61（它最高只支持到 15）。而 AGP 4.1.0 又要求 6.5+，
-      #   JDK 11 + Gradle 6.7.1 是唯一稳妥组合。
-      #   sdkmanager 已经在上面用 JDK 17 跑完了，这里换回去不影响。
       - name: Set up JDK 11 (for Gradle 6.7.1)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '11'
+
+      # 【核心：不再假定 settings.gradle 一定对】
+      # 症状：Task 'assembleDebug' not found in root project 'VirtualGamepad'
+      # 含义：Gradle 只加载了根工程，:app 模块根本没进构建 ——
+      #   可能 settings.gradle 缺失 / 不在工作目录 / 内容是空的 /
+      #   带 BOM / 只有 CRLF 没内容 / include 的不是 ':app'。
+      # 这里逐字节查（cat -A 能看出 BOM 的 M-oM-;M-? 和换行的 ^M$），
+      # 查完不合格就直接重写一份，不靠仓库里那份。
+      - name: Locate and normalize project root
+        run: |
+          set -e
+          WS="$GITHUB_WORKSPACE"
+          echo "===== 仓库根一览 ====="
+          ls -la "$WS" | head -40
+          echo "===== 全仓 find（.gradle/.git 除外，深度 6）====="
+          find "$WS" -maxdepth 6 -not -path '*/.git/*' -not -path '*/.gradle/*' \
+            \( -name 'settings.gradle*' -o -name 'build.gradle*' -o -name 'gradlew' \) \
+            -print 2>/dev/null | head -40
+          echo "===== 所有叫 app 的目录 ====="
+          find "$WS" -maxdepth 6 -type d -name app -not -path '*/.git/*' -print 2>/dev/null | head -10
+
+          # ① 找工程根：优先「根上有 settings.gradle + app」，
+          #    否则找「有 app 目录」的最浅一层
+          PROJ=""
+          if [ -d "$WS/app" ]; then PROJ="$WS"; fi
+          if [ -z "$PROJ" ]; then
+            PROJ=$(find "$WS" -maxdepth 6 -type d -name app -not -path '*/.git/*' \
+                   -printf '%d %p\n' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-)
+            [ -n "$PROJ" ] && PROJ=$(dirname "$PROJ")
+          fi
+          [ -n "$PROJ" ] || { echo "::error::找不到 app 目录"; find "$WS" -maxdepth 3 | head -60; exit 1; }
+          echo "工程根目录: $PROJ"
+          echo "PROJECT_DIR=$PROJ" >> "$GITHUB_ENV"
+
+          # ② 逐字节体检 settings.gradle
+          echo "===== settings.gradle 体检 ====="
+          SG="$PROJ/settings.gradle"
+          if [ -f "$SG" ]; then
+            echo "文件大小: $(wc -c < "$SG") 字节"
+            echo "--- cat -A（显 BOM / 换行）---"
+            cat -A "$SG" | head -20
+            echo "--- 是否含 include ---"
+            grep -c "include" "$SG" || echo "0 处 include"
+          else
+            echo "settings.gradle 不存在"
+          fi
+
+          # ③ 不合格就重写：没文件 / 体积 < 5 字节 / 不含 include ':app'
+          NEED=0
+          if [ ! -f "$SG" ]; then NEED=1
+          elif [ "$(wc -c < "$SG")" -lt 5 ]; then NEED=1
+          elif ! grep -q "include" "$SG"; then NEED=1
+          fi
+          if [ "$NEED" = "1" ]; then
+            echo "::warning::settings.gradle 不合格，自动重写"
+            # 去掉可能的 BOM，用 printf 写纯 ASCII，避免 Windows 编辑器再引入 BOM
+            printf "include ':app'\n" > "$SG"
+            chmod 644 "$SG"
+          fi
+          echo "--- 最终 settings.gradle（cat -A）---"
+          cat -A "$SG"
+
+          # ④ app/build.gradle 必须在，且要认得出是 Android 应用模块
+          echo "===== app/build.gradle 体检 ====="
+          if [ ! -f "$PROJ/app/build.gradle" ]; then
+            echo "::error::app/build.gradle 不存在"
+            ls -la "$PROJ/app" | head -30
+            exit 1
+          fi
+          head -5 "$PROJ/app/build.gradle"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -163,70 +169,73 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 【为什么单独验一遍】
-      #   之前几次失败都只报 exit 1、看不到原因。这一步把 wrapper 三件套
-      #   （gradlew / gradle-wrapper.jar / properties）是否存在、jar 是否
-      #   能读出 GradleWrapperMain 直接打出来，能立刻排除"文件没传上去"这类问题。
       - name: Verify Gradle wrapper files
         run: |
           set -e
-          echo "--- ls -la 仓库根 ---"
-          ls -la . | head -30
-          echo "--- ls -la gradle/wrapper ---"
-          ls -la gradle/wrapper || { echo "::error::gradle/wrapper 目录不存在"; exit 1; }
-          echo "--- gradlew 存在? ---"
-          test -f ./gradlew || { echo "::error::gradlew 不存在（是否被 .gitignore 挡了？）"; exit 1; }
-          echo "--- jar 里有没有 GradleWrapperMain ---"
-          unzip -l gradle/wrapper/gradle-wrapper.jar 2>/dev/null | grep -i GradleWrapperMain \
-            || echo "::warning::jar 里没找到 GradleWrapperMain，wrapper 跑不起来"
-          echo "--- distributionUrl ---"
-          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+          cd "$PROJECT_DIR"
+          test -f ./gradlew || { echo "::error::gradlew 不存在"; ls -la . | head -30; exit 1; }
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "::error::gradle-wrapper.jar 不存在"
+          else
+            unzip -l gradle/wrapper/gradle-wrapper.jar 2>/dev/null | grep -i GradleWrapperMain \
+              || echo "::warning::jar 里没有 GradleWrapperMain"
+            grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+          fi
           chmod +x ./gradlew
 
-      # 这一步**故意允许失败**：它能把 Gradle 自身的启动错误暴露出来，
-      # 而 assembleDebug 的错误往往被 AGP 的输出淹没。失败了不代表构建失败。
-      - name: Gradle wrapper sanity check
+      # 允许失败：只为排障。正常应看到 Root project + Project ':app'
+      - name: Gradle projects sanity check
         continue-on-error: true
         run: |
-          ./gradlew --version 2>&1 | tee gradle-version.log
+          cd "$PROJECT_DIR"
+          ./gradlew projects 2>&1 | tee "$GITHUB_WORKSPACE/gradle-projects.log"
           echo "退出码: ${PIPESTATUS[0]}"
+          echo "--- 有没有 :app ---"
+          grep -n "':app'" "$GITHUB_WORKSPACE/gradle-projects.log" || echo "未出现 :app"
 
-      # Debug APK：用 Gradle 自带的 debug key 签名，下载下来能直接装。
-      # 输出 tee 到文件，失败时由下面那一步把尾巴打出来。
+      # 显式指定 :app，模块没进去会立刻报得更清楚
       - name: Build Debug APK
         run: |
           set -eo pipefail
-          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee gradle-debug.log
+          cd "$PROJECT_DIR"
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace 2>&1 \
+            | tee "$GITHUB_WORKSPACE/gradle-debug.log"
 
-      # Release APK：没配签名的话出来的是 -unsigned.apk（装不上，仅留档）。
       - name: Build Release APK
         run: |
           set -eo pipefail
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee gradle-release.log
+          cd "$PROJECT_DIR"
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 \
+            | tee "$GITHUB_WORKSPACE/gradle-release.log"
 
-      # 【排障专用】只有在前面任何一步失败时才跑。
-      # 把 Gradle 日志尾部、daemon 日志、构建报告全部打出来并上传，
-      # 下次不用再靠猜。
+      - name: Collect APKs
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p apks/debug apks/release
+          cp -v "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk   apks/debug/   2>&1 || true
+          cp -v "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk apks/release/ 2>&1 || true
+          find apks -type f -name '*.apk' -print
+
       - name: Dump failure logs
         if: failure()
         run: |
-          echo "=========== gradle-debug.log 末 200 行 ==========="
-          tail -n 200 gradle-debug.log 2>/dev/null || echo "(无 gradle-debug.log)"
-          echo "=========== gradle-version.log ==========="
-          tail -n 40 gradle-version.log 2>/dev/null || echo "(无 gradle-version.log)"
-          echo "=========== Gradle daemon 日志 ==========="
+          cd "$GITHUB_WORKSPACE" 2>/dev/null || true
+          echo "===== gradle-projects.log ====="
+          head -n 50 gradle-projects.log 2>/dev/null || echo "(无)"
+          echo "===== gradle-debug.log 末 200 行 ====="
+          tail -n 200 gradle-debug.log 2>/dev/null || echo "(无)"
+          echo "===== daemon 日志 ====="
           for f in "$HOME"/.gradle/daemon/*/daemon-*.log; do
-            [ -f "$f" ] || continue
-            echo "--- $f ---"
-            tail -n 60 "$f"
+            [ -f "$f" ] || continue; echo "--- $f ---"; tail -n 60 "$f"
           done
-          echo "=========== 错误行汇总 ==========="
+          echo "===== 错误行汇总 ====="
           grep -n -i -E "error:|FAILED|What went wrong|Caused by" \
-            gradle-debug.log gradle-release.log 2>/dev/null | head -60 \
+            gradle-debug.log gradle-release.log gradle-projects.log 2>/dev/null | head -60 \
             || echo "(未匹配到)"
 
       - name: Upload failure logs
@@ -237,22 +246,14 @@ jobs:
           path: |
             gradle-debug.log
             gradle-release.log
-            gradle-version.log
-            app/build/reports
+            gradle-projects.log
           if-no-files-found: ignore
 
       # —— 可选：正式签名 ——
-      # 不配 secrets 就整段跳过，不影响上面两步。
-      # 去仓库 Settings → Secrets → New repository secret 加这四个：
-      #   KEYSTORE_BASE64      keystore 文件内容 base64
-      #                        （本地跑：base64 -w0 my.keystore）
-      #   KEYSTORE_PASSWORD    密钥库密码
-      #   KEY_ALIAS            别名
-      #   KEY_PASSWORD         别名密码
-      # 【为什么不在 if: 里判断 secrets】
-      #   step 的 if: 条件里**读不到 secrets 上下文**，写了会直接
-      #   Invalid workflow file（Unrecognized named-value: 'secrets'），
-      #   整个工作流连跑都跑不起来。所以判断放到 shell 里做。
+      # 不配 secrets 就整段跳过。
+      # Settings → Secrets 加四个：KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
+      # 【为什么不在 if: 里判断 secrets】step 的 if: 读不到 secrets 上下文，
+      # 写了会 Invalid workflow file，整个工作流跑不起来。所以判断放 shell。
       - name: Sign release APK
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -261,50 +262,44 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -e
-          # 没配 secrets 时 env 是空串，这里自己退出，等同原来的 if。
           if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "未配置签名 secrets，跳过签名（release 仍是 unsigned，仅留档）"
-            exit 0
+            echo "未配置签名 secrets，跳过（release 为 unsigned，仅留档）"; exit 0
           fi
+          cd "$GITHUB_WORKSPACE"
+          UNSIGNED=$(ls apks/release/app-release-unsigned.apk 2>/dev/null || true)
+          [ -n "$UNSIGNED" ] || { echo "::error::找不到 unsigned apk"; exit 0; }
           BT="$ANDROID_HOME/build-tools/33.0.1"
           [ -d "$BT" ] || BT="$ANDROID_SDK_ROOT/build-tools/33.0.1"
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
-          "$BT/zipalign" -f 4 \
-            app/build/outputs/apk/release/app-release-unsigned.apk \
-            "$RUNNER_TEMP/aligned.apk"
-          "$BT/apksigner" sign \
-            --ks "$RUNNER_TEMP/keystore.jks" \
+          "$BT/zipalign" -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/keystore.jks" \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass pass:"$KEYSTORE_PASSWORD" \
             --key-pass pass:"$KEY_PASSWORD" \
-            --out "$RUNNER_TEMP/signed.apk" \
-            "$RUNNER_TEMP/aligned.apk"
+            --out "$RUNNER_TEMP/signed.apk" "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" verify "$RUNNER_TEMP/signed.apk"
-          cp "$RUNNER_TEMP/signed.apk" \
-            app/build/outputs/apk/release/app-release-signed.apk
+          cp "$RUNNER_TEMP/signed.apk" apks/release/app-release-signed.apk
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: apks/debug/*.apk
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: app-release
-          path: app/build/outputs/apk/release/*.apk
+          path: apks/release/*.apk
           if-no-files-found: ignore
 
-      # 只有 push tag（v*）时才建 Release。
-      # 打 tag 的方式：git tag v26.9.27.22.05 && git push origin v26.9.27.22.05
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           files: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
+            apks/debug/*.apk
+            apks/release/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
