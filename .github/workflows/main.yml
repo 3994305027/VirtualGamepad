@@ -135,7 +135,7 @@ jobs:
             echo "::error::仓库里找不到 app 目录%0A$(echo "$APPS" | sed ':a;N;$!ba;s/\n/%0A/g')"
             exit 1
           fi
-          echo "PROJECT_DIR=$PROJ" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJ" >> "${GITHUB_ENV:-/dev/null}"
           echo "工程根目录: $PROJ" | tee -a "$DIAG"
 
           # ② settings.gradle 逐字节体检（cat -A 能看出 BOM 的 M-oM-;M-? 与 ^M$）
@@ -160,6 +160,50 @@ jobs:
             printf "include ':app'\n" > "$SG"
             chmod 644 "$SG"
             echo "重写后: $(cat -A "$SG" | tr '\n' '|')" | tee -a "$DIAG"
+          fi
+
+          # ③b 根 build.gradle 体检 —— 症状 "Plugin with id 'com.android.application'
+          # not found" 的真正来源：AGP 的 classpath 挂在**根**工程的 buildscript 里，
+          # 根 build.gradle 缺失 / 被覆盖 / 内容不对，子模块就找不到插件。
+          RB="$PROJ/build.gradle"
+          echo "===== 根 build.gradle 体检 =====" | tee -a "$DIAG"
+          if [ -f "$RB" ]; then
+            echo "大小: $(wc -c < "$RB") 字节" | tee -a "$DIAG"
+            echo "含 buildscript: $(grep -c buildscript "$RB" || true)" | tee -a "$DIAG"
+            echo "含 AGP classpath: $(grep -c 'com.android.tools.build:gradle' "$RB" || true)" | tee -a "$DIAG"
+            echo "误放成 app 的: $(grep -c 'com.android.application' "$RB" || true)" | tee -a "$DIAG"
+          else
+            echo "根 build.gradle 不存在" | tee -a "$DIAG"
+          fi
+
+          RNEED=0
+          if [ ! -f "$RB" ]; then RNEED=1
+          elif [ "$(wc -c < "$RB")" -lt 50 ]; then RNEED=1
+          elif ! grep -q "com.android.tools.build:gradle" "$RB"; then RNEED=1
+          fi
+          if [ "$RNEED" = "1" ]; then
+            echo "::warning::根 build.gradle 不合格（缺 AGP classpath），已自动重写"
+            # 不用 heredoc：YAML 缩进会让结束符带空格而不被识别
+            printf '%s\n' \
+              'buildscript {' \
+              '    repositories {' \
+              '        google()' \
+              '        mavenCentral()' \
+              '    }' \
+              '    dependencies {' \
+              "        classpath 'com.android.tools.build:gradle:4.1.0'" \
+              '    }' \
+              '}' \
+              '' \
+              'allprojects {' \
+              '    repositories {' \
+              '        google()' \
+              '        mavenCentral()' \
+              "        maven { url 'https://maven.rikka.app' }" \
+              '    }' \
+              '}' > "$RB"
+            chmod 644 "$RB"
+            echo "重写后大小: $(wc -c < "$RB") 字节" | tee -a "$DIAG"
           fi
 
           # ④ app/build.gradle 必须在，且必须有 Android 应用插件
@@ -245,6 +289,8 @@ jobs:
           {
             echo "===== settings.gradle ====="
             cat "$PROJECT_DIR/settings.gradle" 2>/dev/null || echo "(无)"
+            echo "===== 根 build.gradle（AGP classpath 所在）====="
+            cat "$PROJECT_DIR/build.gradle" 2>/dev/null || echo "(无)"
             echo "===== app 目录前 20 项 ====="
             ls -A "$PROJECT_DIR/app" 2>/dev/null | head -20
             echo "===== app/build.gradle 前 12 行 ====="
