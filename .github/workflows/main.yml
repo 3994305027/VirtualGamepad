@@ -28,13 +28,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # AGP 4.1.0 + Gradle 6.7.1 用 JDK 11 是官方兼容组合。
-      # 别用 JDK 17/21：Gradle 6.x 在 17+ 上会报 Unsupported class file major version。
-      - name: Set up JDK 11
+      # 【为什么先装 JDK 17】
+      #   实测报错：
+      #     UnsupportedClassVersionError: SdkManagerCli has been compiled by a
+      #     more recent version of the Java Runtime (class file version 61.0),
+      #     this version ... only recognizes ... up to 55.0
+      #   class 61 = Java 17，class 55 = Java 11。
+      #   也就是新版 sdkmanager **必须**跑在 JDK 17 上，JDK 11 起不来。
+      #   但 Gradle 6.7.1 又**不能**跑在 JDK 17 上（会报 Unsupported class
+      #   file major version 61）。所以这里要装两个 JDK：
+      #     · 装 SDK 用 17
+      #     · 编译用 11
+      #   顺序不能反 —— setup-java 后一次会覆盖 JAVA_HOME。
+      - name: Set up JDK 17 (for sdkmanager)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '11'
+          java-version: '17'
 
       # 先打一份环境诊断。这一步永不失败，失败时要靠它定位。
       - name: Print SDK diagnostics
@@ -52,6 +62,8 @@ jobs:
           echo "--- JAVA_HOME / java 版本 ---"
           echo "JAVA_HOME=$JAVA_HOME"
           java -version 2>&1 || true
+          echo "--- /usr/lib/jvm 里可用的 JDK ---"
+          ls -1 /usr/lib/jvm 2>&1 | head -20 || true
 
       # 【为什么这一步写这么长】
       #   上一版在这里直接 exit 1（找不到 sdkmanager 就报错），整个 job 9 秒就挂了。
@@ -75,7 +87,24 @@ jobs:
             exit 0
           fi
 
-          # ③ 找 sdkmanager：latest → 任意版本号 → 老式 tools
+          # ③ 确认 java 是 17+（sdkmanager 的硬性要求）
+          #    万一上一步 setup-java 没生效，就在 /usr/lib/jvm 里找一个
+          JAVA_MAJOR=$(java -version 2>&1 | awk -F'"' '/version/{print $2}' \
+                       | awk -F'.' '{print ($1=="1")?$2:$1}')
+          echo "当前 java 主版本: ${JAVA_MAJOR:-未知}"
+          if [ -z "$JAVA_MAJOR" ] || [ "$JAVA_MAJOR" -lt 17 ] 2>/dev/null; then
+            for j in /usr/lib/jvm/*17* /usr/lib/jvm/*21*; do
+              if [ -x "$j/bin/java" ]; then
+                export JAVA_HOME="$j"
+                export PATH="$j/bin:$PATH"
+                echo "改用 $JAVA_HOME"
+                break
+              fi
+            done
+          fi
+          java -version 2>&1 || true
+
+          # ④ 找 sdkmanager：latest → 任意版本号 → 老式 tools
           SDKMANAGER=""
           for p in \
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
@@ -85,7 +114,7 @@ jobs:
             if [ -n "$p" ] && [ -x "$p" ]; then SDKMANAGER="$p"; break; fi
           done
 
-          # ④ 都没有就自己下一份 commandlinetools
+          # ⑤ 都没有就自己下一份 commandlinetools
           if [ -z "$SDKMANAGER" ]; then
             echo "镜像里没有 sdkmanager，自行下载 commandlinetools"
             mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -103,8 +132,9 @@ jobs:
           chmod +x "$SDKMANAGER" 2>/dev/null || true
           echo "sdkmanager: $SDKMANAGER"
 
-          # ⑤ 装包。--sdk_root 必须显式给，否则新版 sdkmanager 可能装到别的目录
-          yes | "$SDKMANAGER" --licenses --sdk_root="$ANDROID_HOME" >/dev/null 2>&1 || true
+          # ⑥ 装包。--sdk_root 必须显式给，否则新版 sdkmanager 可能装到别的目录
+          printf 'y\ny\ny\ny\ny\ny\ny\ny\ny\ny\n' \
+            | "$SDKMANAGER" --licenses --sdk_root="$ANDROID_HOME" >/dev/null 2>&1 || true
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "platforms;android-33" \
             "build-tools;33.0.1" \
@@ -112,9 +142,20 @@ jobs:
             || "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
                  "platforms;android-33" "build-tools;33.0.1" "platform-tools"
 
-          # ⑥ 装完复查，没装到就直接报出来
+          # ⑦ 装完复查，没装到就直接报出来
           ls -d "$ANDROID_HOME/platforms/android-33" \
                 "$ANDROID_HOME/build-tools/33.0.1" 2>&1 || true
+
+      # 【为什么这里切回 JDK 11】
+      #   Gradle 6.7.1 在 JDK 17 上会报 Unsupported class file major
+      #   version 61（它最高只支持到 15）。而 AGP 4.1.0 又要求 6.5+，
+      #   JDK 11 + Gradle 6.7.1 是唯一稳妥组合。
+      #   sdkmanager 已经在上面用 JDK 17 跑完了，这里换回去不影响。
+      - name: Set up JDK 11 (for Gradle 6.7.1)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -126,16 +167,79 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x ./gradlew
+      # 【为什么单独验一遍】
+      #   之前几次失败都只报 exit 1、看不到原因。这一步把 wrapper 三件套
+      #   （gradlew / gradle-wrapper.jar / properties）是否存在、jar 是否
+      #   能读出 GradleWrapperMain 直接打出来，能立刻排除"文件没传上去"这类问题。
+      - name: Verify Gradle wrapper files
+        run: |
+          set -e
+          echo "--- ls -la 仓库根 ---"
+          ls -la . | head -30
+          echo "--- ls -la gradle/wrapper ---"
+          ls -la gradle/wrapper || { echo "::error::gradle/wrapper 目录不存在"; exit 1; }
+          echo "--- gradlew 存在? ---"
+          test -f ./gradlew || { echo "::error::gradlew 不存在（是否被 .gitignore 挡了？）"; exit 1; }
+          echo "--- jar 里有没有 GradleWrapperMain ---"
+          unzip -l gradle/wrapper/gradle-wrapper.jar 2>/dev/null | grep -i GradleWrapperMain \
+            || echo "::warning::jar 里没找到 GradleWrapperMain，wrapper 跑不起来"
+          echo "--- distributionUrl ---"
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+          chmod +x ./gradlew
+
+      # 这一步**故意允许失败**：它能把 Gradle 自身的启动错误暴露出来，
+      # 而 assembleDebug 的错误往往被 AGP 的输出淹没。失败了不代表构建失败。
+      - name: Gradle wrapper sanity check
+        continue-on-error: true
+        run: |
+          ./gradlew --version 2>&1 | tee gradle-version.log
+          echo "退出码: ${PIPESTATUS[0]}"
 
       # Debug APK：用 Gradle 自带的 debug key 签名，下载下来能直接装。
+      # 输出 tee 到文件，失败时由下面那一步把尾巴打出来。
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          set -eo pipefail
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee gradle-debug.log
 
       # Release APK：没配签名的话出来的是 -unsigned.apk（装不上，仅留档）。
       - name: Build Release APK
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: |
+          set -eo pipefail
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee gradle-release.log
+
+      # 【排障专用】只有在前面任何一步失败时才跑。
+      # 把 Gradle 日志尾部、daemon 日志、构建报告全部打出来并上传，
+      # 下次不用再靠猜。
+      - name: Dump failure logs
+        if: failure()
+        run: |
+          echo "=========== gradle-debug.log 末 200 行 ==========="
+          tail -n 200 gradle-debug.log 2>/dev/null || echo "(无 gradle-debug.log)"
+          echo "=========== gradle-version.log ==========="
+          tail -n 40 gradle-version.log 2>/dev/null || echo "(无 gradle-version.log)"
+          echo "=========== Gradle daemon 日志 ==========="
+          for f in "$HOME"/.gradle/daemon/*/daemon-*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            tail -n 60 "$f"
+          done
+          echo "=========== 错误行汇总 ==========="
+          grep -n -i -E "error:|FAILED|What went wrong|Caused by" \
+            gradle-debug.log gradle-release.log 2>/dev/null | head -60 \
+            || echo "(未匹配到)"
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            gradle-debug.log
+            gradle-release.log
+            gradle-version.log
+            app/build/reports
+          if-no-files-found: ignore
 
       # —— 可选：正式签名 ——
       # 不配 secrets 就整段跳过，不影响上面两步。
