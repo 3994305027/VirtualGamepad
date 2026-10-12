@@ -1513,6 +1513,96 @@ public final class PadLayout {
         }
     }
 
+    /**
+     * 按下时给不给视觉反馈（高亮那一层）。默认 true。
+     *
+     *   触摸板默认 false：它是一整块拖动区，手指一按整块全亮，
+     *   拖起来像整片在闪，反而看不清底下 —— 所以默认不给。
+     */
+    public final boolean[] feedback = new boolean[N];
+    {
+        for (int i = 0; i < N; i++) {
+            feedback[i] = true;
+        }
+    }
+
+    /** 触摸板轻点动作：什么都不做。 */
+    public static final int PACT_NONE = 0;
+    /** 切发送时机（边滑边发 / 松手才发）。 */
+    public static final int PACT_MODE = 1;
+    public static final int PACT_LEFT = 2;
+    public static final int PACT_RIGHT = 3;
+    public static final int PACT_MID = 4;
+    public static final int PACT_WUP = 5;
+    public static final int PACT_WDN = 6;
+    public static final String[] PACT_NAMES = {
+            "无", "切换模式", "左键", "右键", "中键", "滚轮上", "滚轮下"
+    };
+
+    /** 触摸板单击做什么（默认：左键）。 */
+    public final int[] padTap = new int[N];
+    /** 触摸板双击做什么（默认：右键）。 */
+    public final int[] padDbl = new int[N];
+    /**
+     * 拖动触摸板期间保持按住哪个鼠标键。
+     *
+     *   0 = 不按住（默认）
+     *   1 = 左键    2 = 右键    3 = 中键
+     *   4 = 侧键1（后退）  5 = 侧键2（前进）
+     *
+     * 【优先用侧键】
+     *   保持键一旦和你要点的键是同一个，点一下就必须"松开再按下"，
+     *   那等于多出一次点击（可能被当成双击）。用侧键当保持键就没这个
+     *   问题 —— 游戏里几乎没东西绑在侧键上，按住它既不触发任何操作，
+     *   左键也能照常单击双击，互不干扰。
+     *
+     * 【为什么留这个开关】
+     *   实测：拖动时鼠标键处于按下状态，系统就不会把手指手势判成取消，
+     *   实时模式滑动才顺畅；不按住就会一顿一顿。而"持续发位移抖动"
+     *   经实测无效 —— 说明有效的不是"一直有事件"，而是"按钮按住"。
+     *
+     *   副作用：按住左键拖动 = 拖选（会框选内容）。所以做成可选，
+     *   用户可以试中键 / 右键，挑一个游戏里没有拖拽副作用的。
+     */
+    public final int[] padHold = new int[N];
+
+    /**
+     * 【鼠标移动时避让】开关（全局，不按槽位存）。
+     *
+     * 默认 **false = 不避让**。
+     *
+     * 【为什么默认关】
+     *   拖动时手指正压在触摸板上，一避让手指的 ACTION_MOVE 就收不到了 ——
+     *   实时模式会被自己打断（滑动一顿一顿、甚至直接断流）。
+     *   而且移动只是挪指针、不做命中判定，本来就用不着避让。
+     *
+     * 【什么时候该开】
+     *   某些游戏/界面里，注入的移动没穿透过去、或者点击打到了自己的悬浮窗。
+     *   开这个可以对照排查：开了能穿就是避让的问题，开了还不行是别的原因。
+     */
+    public static boolean sMousePierce = false;
+    /**
+     * 触摸板名字下面那行的来源：false = 跟随双击操作（默认），
+     * true = 跟随改名（改名里写的 \n 就是换行）。
+     *
+     * 【为什么默认是跟随双击操作】
+     *   加这个开关之前，下面那行一直是"双击切模式"，老用户已经认了。
+     *   默认保持原样，不用改设置也还是那个样子。
+     */
+    public final boolean[] padTipName = new boolean[N];
+    {
+        for (int i = 0; i < N; i++) {
+            padTap[i] = PACT_LEFT;
+            padDbl[i] = PACT_RIGHT;
+            padHold[i] = 0;
+        }
+    }
+
+    /** 这个键按下时要不要高亮。 */
+    public boolean fbOn(int i) {
+        return i >= 0 && i < N && feedback[i];
+    }
+
     /** 这个键现在显示成什么名字（没改过就给默认名）。 */
     public String displayName(int i, String defLabel) {
         if (i < 0 || i >= N) {
@@ -2822,6 +2912,8 @@ public final class PadLayout {
         alpha[I_MOUSE_PAD] = MOUSE_PAD_ALPHA;
         // 一大块拖动区，垫在按键下面，别把下面盖住
         prio[I_MOUSE_PAD] = PRIO_MOUSE_PAD;
+        // 触摸板默认不给按下反馈：一大块全亮反而晃眼
+        feedback[I_MOUSE_PAD] = false;
 
         // ---- 左键 / 右键 ----
         float btnR = Math.min(w, h) * 0.075f;
@@ -2910,6 +3002,13 @@ public final class PadLayout {
             heightMul[i] = MOUSE_PAD_H_MUL;
         }
         showLabel[i] = true;
+        feedback[i] = (which != I_MOUSE_PAD);
+        // 触摸板轻点动作：建出来就带默认（双击=切换模式），
+        // 不在这里设的话，新建的触摸板双击没反应，只有内置的才有。
+        padTap[i] = PACT_LEFT;
+        padDbl[i] = PACT_RIGHT;
+        padHold[i] = 0;
+        padTipName[i] = false;
         customName[i] = mouseNameOf(which);
         prio[i] = defaultPrioOf(which);
     }
@@ -3337,6 +3436,8 @@ public final class PadLayout {
             //   见 MIG_* 的说明。当前区间是 -1（不迁移），
             //   只会补写 sch 字段，不动任何已存的位置。
             int sch = o.optInt("sch", 0);
+            // 鼠标移动时避让：老存档没有这个字段，optBoolean 默认 false = 不避让
+            sMousePierce = o.optBoolean("mpm", false);
             if (sch == 0 && MIG_FROM >= 0 && MIG_TO >= MIG_FROM) {
                 JSONObject from = o.optJSONObject(String.valueOf(MIG_FROM));
                 // 区间起点都没存过 = 这份存档本来就没有要迁移的东西，
@@ -3364,6 +3465,12 @@ public final class PadLayout {
                 l.alpha[i] = clampAlpha((float) e.optDouble("a", l.alpha[i]));
                 // 老存档没有 "pr"，按种类给默认值（触摸板自动垫到按键下面）
                 l.prio[i] = clampPrio(e.optInt("pr", PadLayout.defaultPrioOf(i)));
+                // 老存档没有 "pt"/"pd"：单击保持"无"，双击沿用原来的
+                // "双击切换模式"行为，改完不用重设。
+                l.padTap[i] = e.optInt("pat", PACT_LEFT);
+                l.padDbl[i] = e.optInt("pad", PACT_RIGHT);
+                l.padHold[i] = e.optInt("phd", 0);
+                l.padTipName[i] = e.optBoolean("ptn", false);
                 l.hidden[i] = e.optBoolean("h", false);
                 // 老存档没有 "k"，optInt 返回 0 = 空槽位，自动兼容。
                 l.keyCode[i] = e.optInt("k", 0);
@@ -3379,6 +3486,7 @@ public final class PadLayout {
                     l.passOffColor = e.optInt("pf", 0);
                 }
                 l.showLabel[i] = !e.optBoolean("nl", false);
+                l.feedback[i] = !e.optBoolean("nf", false);
                 // 老存档没有 "wm"，默认 1f，自动兼容。
                 // clampMul 兜底：值一旦落到区间外，滑条会显示 0% 但键没变，
                 // 看着像"调节失灵"。夹回区间就不会有这个错觉。
@@ -3887,6 +3995,7 @@ public final class PadLayout {
             o.put("v", versionFor(portrait, layoutId, keyboardMode));
             // 结构版本：老存档没有这个字段，load 时据此判断要不要做下标迁移
             o.put("sch", SCHEMA);
+            o.put("mpm", sMousePierce);
             for (int i = 0; i < N; i++) {
                 JSONObject e = new JSONObject();
                 e.put("x", rx[i]);
@@ -3894,6 +4003,16 @@ public final class PadLayout {
                 e.put("s", scale[i]);
                 e.put("a", alpha[i]);
                 e.put("pr", prio[i]);
+                // 触摸板轻点动作：只给触摸板写，别的所有键都不需要。
+                // 【按"是不是触摸板"判，不认死内置那个槽位】
+                //   鼠标槽位已经能建多个，第二个触摸板也是触摸板，
+                //   写死 I_MOUSE_PAD 的话它设的操作存不下、重开就没了。
+                if (mouseKindOf(i) == 0) {
+                    e.put("pat", padTap[i]);
+                    e.put("pad", padDbl[i]);
+                    e.put("ptn", padTipName[i]);
+                    e.put("phd", padHold[i]);
+                }
                 e.put("h", hidden[i]);
                 e.put("k", keyCode[i]);
                 e.put("sp", shape[i]);
@@ -3915,6 +4034,9 @@ public final class PadLayout {
                 }
                 if (!showLabel[i]) {
                     e.put("nl", true);
+                }
+                if (!feedback[i]) {
+                    e.put("nf", true);
                 }
                 e.put("wm", widthMul[i]);
                 e.put("hm", heightMul[i]);

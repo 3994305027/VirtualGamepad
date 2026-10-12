@@ -39,6 +39,23 @@ abstract class PickList extends View {
         void onButton(int index, boolean pressed);
 
         /**
+         * 告诉外层"手指当前按着哪个元素"，发鼠标事件让开时要把它留下来。
+         *
+         * 【为什么需要这个：长按做不出来】
+         *   发鼠标按键前必须先"让开"（否则注入的点击会打到自己的悬浮窗），
+         *   而让开是**整窗**的：手指正按着的那个按钮也一起变成不接触摸。
+         *   于是正在进行的触摸手势被判 ACTION_CANCEL → releaseAll →
+         *   提前发出 up —— 按下之后约 60ms 键就自己松了。
+         *   不管手指按多久，游戏只收到一次单击，长按永远不成立。
+         *
+         *   把这个元素留下来（其余照常让开），手势就掐不断，
+         *   真 ACTION_UP 才发 up —— 按多久就是按多久。
+         *
+         * @param elem 元素下标；-1 = 没有手指按着 / 手势已结束
+         */
+        void setPierceKeepElem(int elem);
+
+        /**
          * 请求一个"能打字"的界面来给布局改名。
          *
          * 【为什么不能在悬浮窗里直接输入】
@@ -376,6 +393,12 @@ abstract class PickList extends View {
     static final int LIST_RESET_DIM = 19;
     static final int LIST_CREATE = 20;
     static final int LIST_MOUSE = 22;
+    /** 空白没有种类可选，单独一张只有一行的表，好让它也能带「连续创建」。 */
+    static final int LIST_BLANK_ONLY = 40;
+    /** 更多选项 → 操作（只有触摸板有）：选改单击还是双击。 */
+    static final int LIST_PADACT = 41;
+    /** 单击 / 双击具体做什么：无 / 切换模式 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下。 */
+    static final int LIST_PACTPICK = 42;
     /** 鼠标元素候选表：触摸板 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下 */
     static final int[] MOUSE_CANDIDATES = {
             PadLayout.I_MOUSE_PAD, PadLayout.I_MOUSE_L, PadLayout.I_MOUSE_R,
@@ -396,6 +419,8 @@ abstract class PickList extends View {
     static final int LIST_MORE = 21;
     static final int LIST_APPEAR = 39;
     /** 更多选项 → 优先级：一条可拖的条，0 最低 / 100 最高。 */
+    /** LIST_PACTPICK 在改单击还是双击：0 单击 / 1 双击。 */
+    int mPadActKind = 0;
     static final int LIST_COMBO_EDIT = 24;
     static final int LIST_COMBO_TYPE = 25;
     static final int COMBO_ACT_PAD = 1;
@@ -636,6 +661,8 @@ abstract class PickList extends View {
     abstract void drawTrigRow(Canvas c, int pos, RectF r);
     /** 优先级条拖出来的值刷给当前选中的元素（在子类里改 PadLayout）。 */
     abstract void applyPrio(int v);
+    /** 触摸板轻点动作：kind 0 单击 / 1 双击，v 见 PadLayout.PACT_*。 */
+    abstract void applyPadAct(int kind, int v);
     abstract void drawStickXyRow(Canvas c, int pos, RectF r);
     abstract void drawGridRow(Canvas c, int pos, RectF r);
     abstract void drawComboRowButtons(Canvas c, int pos);
@@ -1818,8 +1845,17 @@ abstract class PickList extends View {
             case LIST_MOUSE:
                 title = "鼠标键：选一个";
                 break;
+            case LIST_BLANK_ONLY:
+                title = "创建空白";
+                break;
             case LIST_MORE:
                 title = "更多选项";
+                break;
+            case LIST_PADACT:
+                title = "操作：轻点触摸板做什么";
+                break;
+            case LIST_PACTPICK:
+                title = (mPadActKind == 0) ? "单击做什么" : "双击做什么";
                 break;
             case LIST_APPEAR:
                 title = "外观";
@@ -1942,8 +1978,8 @@ abstract class PickList extends View {
             mBarTextPaint.setColor(0xFFFFFFFF);
         }
 
-        // 「连续创建」勾选框（键盘列表 + 手柄列表，两者都是"点一个就创建"）
-        if (mListMode == LIST_KEY || mListMode == LIST_PAD) {
+        // 「连续创建」勾选框（所有"点一个就创建"的列表都给）
+        if (keepOpenMode()) {
             RectF k = mKeepOpenRect;
             c.drawRoundRect(k, dp(6f), dp(6f),
                     mKeyKeepOpen ? mSlFillPaint : mSlTrackPaint);
@@ -3102,7 +3138,42 @@ abstract class PickList extends View {
             // 选中按钮是"点一项就走"，不是勾选型，没有全选
             mListSelAllRect.setEmpty();
             return;
+        } else if (keepOpenMode()) {
+            // 鼠标 / 空白 / 组合键（做成哪种）这三层都是"点一项就建"，
+            // 和 LIST_PAD 同款：不要「确定」，取消占满整行。
+            if (mListBack != LIST_NONE && !listOkIsClose()) {
+                mListCancelRect.set(left + pad, by, left + pad + bw, by + btnH);
+                mListOkRect.set(left + pad + bw + dp(10f), by, left + pw - pad, by + btnH);
+            } else {
+                mListCancelRect.set(left + pad, by, left + pw - pad, by + btnH);
+                mListOkRect.setEmpty();
+            }
+            float kw = Math.min(dp(96f), pw - pad * 2f);
+            mKeepOpenRect.set(left + pw - pad - kw, top + dp(10f),
+                    left + pw - pad, top + dp(38f));
+            //
+            // 【这个分支是 keepOpenMode() 的兜底，LIST_KEY 和 LIST_PAD 也走这里】
+            //   keepOpenMode() 里包含 LIST_KEY / LIST_PAD，所以下面那两个
+            //   else if (mListMode == LIST_PAD)、else if (mListMode == LIST_KEY)
+            //   永远不可达 —— 想把搜索加在那两个分支里是白加，必须加在这里。
+            //
+            // 三张候选表都给搜索：
+            //   键盘 104 项、手柄几十项、鼠标 6 项，都够多
+            // 不给的两张：
+            //   空白只有 1 行、组合键「做成哪种」只有 2 项，搜不出东西
+            mListSearchRect.setEmpty();
+            if (listCanSearch()
+                    && (mListMode == LIST_KEY || mListMode == LIST_PAD
+                        || mListMode == LIST_MOUSE)) {
+                float seW = Math.min(dp(96f), pw - pad * 2f);
+                float seTop = mKeepOpenRect.bottom + dp(6f);
+                mListSearchRect.set(left + pw - pad - seW, seTop,
+                        left + pw - pad, seTop + dp(30f));
+            }
+            return;
         } else if (mListMode == LIST_PAD) {
+            // 【不可达】keepOpenMode() 已包含 LIST_PAD，走不到这里。
+            // 别再往这个分支里加东西（搜索按钮曾加在这里，等于白加）。
             // 同 LIST_KEY：点一项就创建，不要「确定」
             if (mListBack != LIST_NONE && !listOkIsClose()) {
                 mListCancelRect.set(left + pad, by, left + pad + bw, by + btnH);
@@ -3117,8 +3188,23 @@ abstract class PickList extends View {
             float kh = dp(24f);
             mKeepOpenRect.set(left + pw - pad - kw, top + titleH / 2f - kh / 2f,
                     left + pw - pad, top + titleH / 2f + kh / 2f);
+            //
+            // 【手柄候选键也要能搜索】
+            //   几十个候选（A/B/X/Y/LB/RB/LT/RT/十字键/双摇杆…），
+            //   以前只有键盘那张表摆了搜索按钮，这里提前 return 就漏了 ——
+            //   过滤逻辑本身是通用的（listUsesGenericFilter 默认 true），
+            //   只是没有入口，等于搜不了。
+            //   摆在「连续创建」下面一行、和它右对齐，与键盘表一致。
+            mListSearchRect.setEmpty();
+            if (listCanSearch()) {
+                float seW = Math.min(dp(96f), pw - pad * 2f);
+                float seTop = mKeepOpenRect.bottom + dp(6f);
+                mListSearchRect.set(left + pw - pad - seW, seTop,
+                        left + pw - pad, seTop + dp(30f));
+            }
             return;
         } else if (mListMode == LIST_KEY) {
+            // 【不可达】keepOpenMode() 已包含 LIST_KEY，走不到这里。
             // 键盘列表点一项就创建，没有"勾选再确定"这回事，
             // 所以不要「确定」，关闭按钮占满整行。
             if (mListBack != LIST_NONE && !listOkIsClose()) {
@@ -3582,6 +3668,8 @@ abstract class PickList extends View {
             case LIST_COMBO_CROSS:
             case LIST_BTN_COLOR:   // 十几档固定色，搜什么
             case LIST_COMBO_EDIT:  // 组合键编辑：行数会变，搜索映射对不上
+            case LIST_PADACT:      // 就三行，搜什么
+            case LIST_PACTPICK:    // 7 档固定
                 return false;
             default:
                 return true;
@@ -3747,6 +3835,15 @@ abstract class PickList extends View {
         if (mListMode == LIST_MOUSE) {
             return MOUSE_CANDIDATES.length;
         }
+        if (mListMode == LIST_BLANK_ONLY) {
+            return 1;
+        }
+        if (mListMode == LIST_PADACT) {
+            return 5;   // 单击 / 双击 / 第2行名字 / 拖动保持按下 / 移动时避让
+        }
+        if (mListMode == LIST_PACTPICK) {
+            return PadLayout.PACT_NAMES.length;
+        }
         if (mListMode == LIST_MORE) {
             return moreRowNames().length;
         }
@@ -3860,6 +3957,39 @@ abstract class PickList extends View {
         if (mListMode == LIST_MOUSE) {
             return (pos >= 0 && pos < MOUSE_CANDIDATES.length)
                     ? PadLayout.mouseNameOf(MOUSE_CANDIDATES[pos]) : "";
+        }
+        if (mListMode == LIST_BLANK_ONLY) {
+            return "空白";
+        }
+        if (mListMode == LIST_PADACT) {
+            // 行尾带当前值：进去之前就能看到现在是什么，
+            // 不用先点进去看一眼再退出来（和「优先级」同一套写法）。
+            int sl = padActSlot();
+            if (sl == NONE) {
+                return (pos == 0) ? "单击" : "双击";
+            }
+            if (pos == 2) {
+                // 切换项：点一下在两种来源之间换，行尾显示当前是哪种。
+                return "第2行名字："
+                        + (mLayout.padTipName[sl] ? "跟随改名" : "跟随双击操作");
+            }
+            if (pos == 3) {
+                return "拖动保持按下："
+                        + holdName(mLayout.padHold[sl]);
+            }
+            if (pos == 4) {
+                // 全局开关：不按槽位存，所以直接读静态字段
+                return "鼠标移动时避让："
+                        + (PadLayout.sMousePierce ? "开" : "关");
+            }
+            int v = (pos == 0) ? mLayout.padTap[sl] : mLayout.padDbl[sl];
+            String vn = (v >= 0 && v < PadLayout.PACT_NAMES.length)
+                    ? PadLayout.PACT_NAMES[v] : "无";
+            return ((pos == 0) ? "单击：" : "双击：") + vn;
+        }
+        if (mListMode == LIST_PACTPICK) {
+            return (pos >= 0 && pos < PadLayout.PACT_NAMES.length)
+                    ? PadLayout.PACT_NAMES[pos] : "";
         }
         if (mListMode == LIST_MORE) {
             String[] mn = moreRowNames();
@@ -3981,6 +4111,33 @@ abstract class PickList extends View {
             }
         }
         return n;
+    }
+
+    /** 「操作」改的是哪个键。多选时没有"当前键"，取选中集合第一个。 */
+    /** 「拖动保持按下」那一行显示什么。 */
+    static String holdName(int v) {
+        switch (v) {
+            case 1: return "左键";
+            case 2: return "右键";
+            case 3: return "中键";
+            case 4: return "侧键1(后退)";
+            case 5: return "侧键2(前进)";
+            default: return "不按住";
+        }
+    }
+
+    int padActSlot() {
+        if (mSel != NONE) {
+            return mSel;
+        }
+        if (isMulti()) {
+            for (int i = 0; i < mLayout.N; i++) {
+                if (mSelSet[i] && mLayout.isMousePadAt(i)) {
+                    return i;
+                }
+            }
+        }
+        return NONE;
     }
 
     boolean listUsesGenericFilter() {
@@ -4295,12 +4452,24 @@ abstract class PickList extends View {
         openList(LIST_SYNC_DIR);
     }
 
+    /**
+     * 当前列表支不支持「连续创建」。
+     *
+     * 判定标准是"点一项就立刻建" —— 要勾选再点确定的列表用不上这个开关。
+     * 鼠标、空白、组合键和手柄 / 键盘一样都是"点一个就建"，
+     * 之前只有后两个有，所以前三个没法连着建。
+     */
+    boolean keepOpenMode() {
+        return mListMode == LIST_KEY || mListMode == LIST_PAD
+                || mListMode == LIST_MOUSE || mListMode == LIST_COMBO_KIND
+                || mListMode == LIST_BLANK_ONLY;
+    }
+
     void performListTap(float x, float y) {
         // 「连续创建」放在最前面判定：它在标题行右端，
         // 和列表项、取消按钮都不重叠，先判谁都一样；
         // 但放在这里能保证以后万一调整布局也不会被别的分支吃掉。
-        if ((mListMode == LIST_KEY || mListMode == LIST_PAD)
-                && mKeepOpenRect.contains(x, y)) {
+        if (keepOpenMode() && mKeepOpenRect.contains(x, y)) {
             mKeyKeepOpen = !mKeyKeepOpen;
             invalidate();
             return;
@@ -4878,10 +5047,16 @@ abstract class PickList extends View {
             createMouse(pos);
             return;
         }
+        if (mListMode == LIST_BLANK_ONLY) {
+            createBlank();
+            return;
+        }
         if (mListMode == LIST_CREATE) {
             // 只分流，不创建：选完进对应的候选表，在那儿才是"点一个就建"
             if (pos == CT_BLANK) {
-                createBlank();
+                // 进单独那张表，好让它也能带「连续创建」；
+                // 直接建的话列表当场就关了，连着建只能反复进菜单。
+                openListBack(LIST_BLANK_ONLY, LIST_CREATE);
                 return;
             }
             if (pos == CT_COMBO) {
@@ -4989,6 +5164,62 @@ abstract class PickList extends View {
             openComboEditBack();
             return;
         }
+        if (mListMode == LIST_PADACT) {
+            // 点「单击」/「双击」进下一层选动作；
+            // 点「第2行名字」就地切换（它只有两档，不值得再开一层）。
+            if (pos == 2) {
+                int sl2 = padActSlot();
+                if (sl2 == NONE) {
+                    return;
+                }
+                boolean nf = !mLayout.padTipName[sl2];
+                mLayout.padTipName[sl2] = nf;
+                mLayout.save(getContext());
+                toastLocal(nf
+                        ? "第2行名字：跟随改名（改名里写 \\n 就是换行）"
+                        : "第2行名字：跟随双击操作");
+                invalidate();
+                return;
+            }
+            if (pos == 3) {
+                int sl3 = padActSlot();
+                if (sl3 == NONE) {
+                    return;
+                }
+                mLayout.padHold[sl3] = (mLayout.padHold[sl3] + 1) % 6;
+                mLayout.save(getContext());
+                toastLocal("拖动保持按下：" + holdName(mLayout.padHold[sl3])
+                        + "（建议侧键：几乎没游戏用它，不干扰左键）");
+                invalidate();
+                return;
+            }
+            if (pos == 4) {
+                // 全局开关：改静态字段，不用 padActSlot()
+                boolean np = !PadLayout.sMousePierce;
+                PadLayout.sMousePierce = np;
+                mLayout.save(getContext());
+                toastLocal(np
+                        ? "鼠标移动时避让：开（移动也避让，滑动可能变顿，"
+                                + "用来排查穿透问题）"
+                        : "鼠标移动时避让：关（默认，滑动流畅）");
+                invalidate();
+                return;
+            }
+            if (pos != 0 && pos != 1) {
+                return;
+            }
+            mPadActKind = pos;
+            openListBack(LIST_PACTPICK, LIST_PADACT);
+            return;
+        }
+        if (mListMode == LIST_PACTPICK) {
+            if (pos < 0 || pos >= PadLayout.PACT_NAMES.length) {
+                return;
+            }
+            applyPadAct(mPadActKind, pos);
+            listGoBack();
+            return;
+        }
         if (mListMode == LIST_MORE) {
             String[] mn = moreRowNames();
             if (pos < 0 || pos >= mn.length) {
@@ -5012,6 +5243,9 @@ abstract class PickList extends View {
                 if (mStickCfg) {
                     closeList();
                 }
+            } else if ("操作".equals(name)) {
+                // 只有触摸板有这行（见 moreRowNames），能点到这里说明选中的是触摸板
+                openListBack(LIST_PADACT, LIST_MORE);
             } else if ("编辑组合键".equals(name)) {
                 mComboInSub = false;
                 mComboEditDir = 0;
@@ -5032,11 +5266,48 @@ abstract class PickList extends View {
                 //   面板模式下拖完即生效并存档，和别的滑条一致。
                 openPrioPanel();
                 return;
-            } else if ("外观".equals(name)) {
-                // 记下槽位：子列表里三项都要改"当前这个键"，
-                // 而打开色板之类会切走 mSel，不先存就改错对象。
-                mAppearSlot = mSel;
-                openListBack(LIST_APPEAR, LIST_MORE);
+            } else if ("形状".equals(name)) {
+                mStickCfg = false;
+                mShapeMode = !mShapeMode;
+                // 形状滑条画在面板上，列表浮着会把它盖住
+                if (mShapeMode) {
+                    closeList();
+                }
+                invalidate();
+                return;
+            } else if ("改名".equals(name)) {
+                closeList();
+                renameKeyNow();
+                return;
+            } else if ("改背景颜色".equals(name)) {
+                closeList();
+                if (mSelSet[PadLayout.I_PASS]) {
+                    openList(LIST_PASS_COLOR);
+                } else {
+                    mColorPassState = 0;
+                    openList(LIST_BTN_COLOR);
+                }
+                invalidate();
+                return;
+            } else if (name != null && name.startsWith("按键名")) {
+                for (int i = 0; i < PadLayout.N; i++) {
+                    if (mSelSet[i]) {
+                        mLayout.showLabel[i] = !mLayout.showLabel[i];
+                    }
+                }
+                mLayout.save(getContext());
+                closeList();
+                invalidate();
+                return;
+            } else if (name != null && name.startsWith("点击反馈")) {
+                for (int i = 0; i < PadLayout.N; i++) {
+                    if (mSelSet[i]) {
+                        mLayout.feedback[i] = !mLayout.feedback[i];
+                    }
+                }
+                mLayout.save(getContext());
+                closeList();
+                invalidate();
                 return;
             }
             invalidate();

@@ -470,7 +470,11 @@ public class GamepadView extends PickList {
         //   它都固定在第 1 位，位置不会因为我加行就往下掉。
         //
         //   （形状已并入外观：它改的也是这个键长什么样，单列反而分散。）
-        a.add("外观");
+        a.add("形状");
+        a.add("改名");
+        a.add("改背景颜色");
+        a.add((mSel != NONE) ? ("按键名：" + (mLayout.labelOn(mSel) ? "显示" : "隐藏")) : "按键名");
+        a.add((mSel != NONE) ? ("点击反馈：" + (mLayout.fbOn(mSel) ? "开" : "关")) : "点击反馈");
         // 【优先级固定在第 2 位】
         //   谁盖住谁是叠放时最先要调的，位置不能因为我往后加行就往下掉。
         // 【行尾带上当前值】
@@ -485,6 +489,12 @@ public class GamepadView extends PickList {
         if (mSel != NONE && PadLayout.isComboSlot(mSel)
                 && mLayout.isComboUsed(mSel)) {
             a.add("编辑组合键");
+        }
+        // 【只有触摸板有「操作」】
+        //   轻点触摸板做什么（单击 / 双击各能设一个动作）是触摸板独有的，
+        //   别的键没有"轻点"这回事 —— 它们按下就是直接触发。
+        if (mSel != NONE && mLayout.isMousePadAt(mSel)) {
+            a.add("操作");
         }
         return a.toArray(new String[a.size()]);
     }
@@ -897,7 +907,8 @@ public class GamepadView extends PickList {
      *
      * 切换：在触摸板上**双击**（快点两下，别拖动）。
      */
-    private static boolean sMouseDefer = true;
+    /** 默认实时（边滑边发）。 */
+    private static boolean sMouseDefer = false;
 
     /**
      * 触摸板拖动时要不要画落点预览。
@@ -918,6 +929,120 @@ public class GamepadView extends PickList {
                 .getBoolean(PREF_MOUSE_PREVIEW, MOUSE_PREVIEW_DEFAULT);
     }
 
+    /**
+     * 滚轮长按连发：按住不放就一直滚，松手停。
+     *
+     * 【为什么以前是一下只滚一格】
+     *   原来只在 ACTION_DOWN 发一次，注释写着"滚轮没有按住的概念"。
+     *   但按住滚轮想连续滚是很自然的用法 —— 按一下只滚一格，
+     *   要滚十格就得点十下。所以做成和键盘长按一个路子：
+     *   先发一格，按住超过 400ms 之后每隔 90ms 补一格。
+     */
+    private static final long WHEEL_REPEAT_DELAY_MS = 400L;
+    private static final long WHEEL_REPEAT_INTERVAL_MS = 90L;
+    private int mWheelElem = NONE;
+    private int mWheelDir = 0;
+
+    private final Runnable mWheelRepeat = new Runnable() {
+        @Override
+        public void run() {
+            if (mWheelElem == NONE || mSink == null) {
+                return;
+            }
+            mSink.onMouseWheel(mWheelDir);
+            postDelayed(mWheelRepeat, WHEEL_REPEAT_INTERVAL_MS);
+        }
+    };
+
+    private void startWheelRepeat(int elem, int dir) {
+        stopWheelRepeat();
+        mWheelElem = elem;
+        mWheelDir = dir;
+        postDelayed(mWheelRepeat, WHEEL_REPEAT_DELAY_MS);
+    }
+
+    private void stopWheelRepeat() {
+        removeCallbacks(mWheelRepeat);
+        mWheelElem = NONE;
+        mWheelDir = 0;
+    }
+
+    /** 按住指令落地的大致耗时，和 FloatingService 的让开等待一致。 */
+    private static final long MOUSE_PIERCE_SETTLE_MS_GUESS = 70L;
+    /**
+     * 因「拖动保持按下」而正处于按住状态的键（-1 = 没按住）。
+     *
+     * 【为什么必须单独记】
+     *   手指被系统 CANCEL 时走的是 releaseAll，不走 ACTION_UP 分支，
+     *   以前那里没发抬起 —— 于是左键就一直卡在按住状态。
+     *   表现是"第一下滑不动，第二下却很顺"：第二下顺，正是因为
+     *   上一轮的键根本没松开。这是 bug，不是特性（会一直框选）。
+     *   现在按住状态单独记，UP / CANCEL / 切布局 一律补发抬起。
+     */
+    private int mHoldBtn = -1;
+    /**
+     * 按住指令发出后、真正生效前的缓冲窗口。
+     *
+     *   按下事件要排在队列里等让开落地（约 60ms）才真正发出去，
+     *   这期间的位移如果照发，全是"按钮还没按下"状态下的位移 ——
+     *   正好会被系统判成取消，第一下就废了。
+     *   所以这段时间的位移先攒着，等按住生效后一次性补发出去。
+     */
+    private boolean mHoldArming;
+
+    private final Runnable mHoldArmed = new Runnable() {
+        @Override
+        public void run() {
+            mHoldArming = false;
+            flushHoldAcc();
+        }
+    };
+
+    /** 把缓冲窗口里攒下的位移补发出去（只在实时模式下有意义）。 */
+    private void flushHoldAcc() {
+        if (sMouseDefer || mSink == null) {
+            return;
+        }
+        int ax = Math.round(mMouseAccX);
+        int ay = Math.round(mMouseAccY);
+        while (ax != 0 || ay != 0) {
+            int sx = clampDelta(ax);
+            int sy = clampDelta(ay);
+            mSink.onMouseMove(sx, sy);
+            ax -= sx;
+            ay -= sy;
+        }
+        mMouseAccX = 0;
+        mMouseAccY = 0;
+    }
+
+    /** 补发抬起（如果正处于按住状态）。 */
+    private void releaseHold() {
+        removeCallbacks(mHoldArmed);
+        mHoldArming = false;
+        if (mHoldBtn >= 0) {
+            if (mSink != null) {
+                mSink.onMouseButton(mHoldBtn, false);
+            }
+            mHoldBtn = -1;
+        }
+    }
+
+    /** 「拖动保持按下」设的是哪个键（0 = 不按住）。 */
+    private int holdBtnOf(int elem) {
+        if (mLayout == null || elem < 0 || elem >= PadLayout.N) {
+            return -1;
+        }
+        switch (mLayout.padHold[elem]) {
+            case 1: return MouseReport.BTN_LEFT;
+            case 2: return MouseReport.BTN_RIGHT;
+            case 3: return MouseReport.BTN_MIDDLE;
+            case 4: return MouseReport.BTN_SIDE1;
+            case 5: return MouseReport.BTN_SIDE2;
+            default: return -1;
+        }
+    }
+
     /** 松手才发模式下累计的位移（已乘过灵敏度）。 */
     private float mMouseAccX;
     private float mMouseAccY;
@@ -926,6 +1051,81 @@ public class GamepadView extends PickList {
     private boolean mMouseMoved;
     /** 上一次轻点触摸板的时间，用来认双击。 */
     private long mMouseTapMs;
+    /** 双击认定窗口，和原来写死的 400 一致。 */
+    private static final long DOUBLE_TAP_MS = 400L;
+    /** 待执行的单击动作（等双击窗口过去才跑）。 */
+    private Runnable mPendingTap;
+
+    private void cancelPendingTap() {
+        if (mPendingTap != null) {
+            removeCallbacks(mPendingTap);
+            mPendingTap = null;
+        }
+    }
+
+    private void postPendingTap(final int elem, final int act) {
+        cancelPendingTap();
+        mPendingTap = new Runnable() {
+            public void run() {
+                mPendingTap = null;
+                runPadAct(elem, act);
+            }
+        };
+        postDelayed(mPendingTap, DOUBLE_TAP_MS);
+    }
+
+    /** 执行触摸板轻点动作：无 / 切换模式 / 左键 / 右键 / 中键 / 滚轮上 / 滚轮下。 */
+    private void runPadAct(int elem, int act) {
+        switch (act) {
+            case PadLayout.PACT_MODE:
+                sMouseDefer = !sMouseDefer;
+                toastLocal(sMouseDefer
+                        ? "鼠标：松手才发（滑动中不发事件）"
+                        : "鼠标：边滑边发（实时）");
+                break;
+            case PadLayout.PACT_LEFT:
+            case PadLayout.PACT_RIGHT:
+            case PadLayout.PACT_MID: {
+                int b = (act == PadLayout.PACT_LEFT) ? MouseReport.BTN_LEFT
+                        : (act == PadLayout.PACT_RIGHT) ? MouseReport.BTN_RIGHT
+                        : MouseReport.BTN_MIDDLE;
+                clickWithHold(b);
+                break;
+            }
+            case PadLayout.PACT_WUP:
+            case PadLayout.PACT_WDN:
+                mSink.onMouseWheel((act == PadLayout.PACT_WUP) ? 1 : -1);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /**
+     * 点一下鼠标键，同时不破坏「拖动保持按下」的状态。
+     *
+     * 【冲突在哪】
+     *   要流畅就得让某个键一直按着；但那个键一旦被"点一下"（down + up），
+     *   up 就会把它松开 —— 保持状态消失，流畅也没了。
+     *   所以点在**同一个键**上时，序列是：
+     *       松开(结束保持) → 按下 → 抬起(完成点击) → 再按下(恢复保持)
+     *   点在**别的键**上时互不影响，直接 down + up 即可，
+     *   这也是为什么建议把保持键设成中键：左键就能随便点。
+     */
+    private void clickWithHold(int b) {
+        if (mSink == null) {
+            return;
+        }
+        if (mHoldBtn >= 0 && mHoldBtn == b) {
+            mSink.onMouseButton(b, false);   // 结束保持
+            mSink.onMouseButton(b, true);    // 点击：按下
+            mSink.onMouseButton(b, false);   // 点击：抬起
+            mSink.onMouseButton(b, true);    // 恢复保持
+        } else {
+            mSink.onMouseButton(b, true);
+            mSink.onMouseButton(b, false);
+        }
+    }
 
     /**
      * 鼠标槽位 -> MouseReport 的按键号。
@@ -2284,11 +2484,24 @@ public class GamepadView extends PickList {
      * @return 实际填入的矩形数量
      */
     public int buildTouchRegion(android.graphics.Rect[] out) {
+        return buildTouchRegion(out, -1);
+    }
+
+    /**
+     * 生成触摸区矩形。
+     *
+     * @param keepElem >= 0 时**只**生成这一个元素的矩形，其余全部丢弃。
+     *   A 方案用它：让开时保住手指按着的那一块，手势才不会被掐断。
+     */
+    public int buildTouchRegion(android.graphics.Rect[] out, int keepElem) {
         if (mLayout == null || out == null) {
             return 0;
         }
         int n = 0;
         for (int i = 0; i < PadLayout.N && n < out.length; i++) {
+            if (keepElem >= 0 && i != keepElem) {
+                continue;
+            }
             if (!pickable(i)) {
                 continue;
             }
@@ -4741,8 +4954,15 @@ public class GamepadView extends PickList {
         selectSingle(idx);
         computeGeometry();
         mLayout.save(getContext());
-        closeList();
-        invalidate();
+        if (mKeyKeepOpen) {
+            // 连续创建：这张表只有一行，留在原地接着点就行。
+            // 新建的都落在屏幕中间，之后一个个拖开。
+            mSel = idx;
+            invalidate();
+        } else {
+            closeList();
+            invalidate();
+        }
     }
 
     /**
@@ -4786,8 +5006,15 @@ public class GamepadView extends PickList {
         selectSingle(idx);
         computeGeometry();
         mLayout.save(getContext());
-        closeList();
-        invalidate();
+        if (mKeyKeepOpen) {
+            // 连续创建：留在「做成哪种」那层，选一次建一个。
+            // 建出来都落在屏幕中间，之后一个个拖开。
+            mSel = idx;
+            invalidate();
+        } else {
+            closeList();
+            invalidate();
+        }
     }
 
     // ---- 组合键编辑列表 ----
@@ -5290,6 +5517,23 @@ public class GamepadView extends PickList {
     }
 
     /** 拖条出来的值刷给选中的元素，立刻生效并存档。 */
+    /** 触摸板轻点动作：改完立刻存档，和别的调节一致。 */
+    void applyPadAct(int kind, int v) {
+        int sl = padActSlot();
+        if (sl == NONE) {
+            return;
+        }
+        if (kind == 0) {
+            mLayout.padTap[sl] = v;
+        } else {
+            mLayout.padDbl[sl] = v;
+        }
+        mLayout.save(getContext());
+        toastLocal(((kind == 0) ? "单击：" : "双击：")
+                + ((v >= 0 && v < PadLayout.PACT_NAMES.length)
+                   ? PadLayout.PACT_NAMES[v] : "无"));
+    }
+
     void applyPrio(int v) {
         if (mLayout == null) {
             return;
@@ -6954,6 +7198,12 @@ public class GamepadView extends PickList {
     }
 
     private void onDown(int elem, float x, float y) {
+        // 【A 方案：让开时保住手指这一块】
+        //   必须在 onMouseButton 之前记 —— 那边一发按键就会让开，
+        //   晚一步这个元素就跟着整窗一起不接触摸了。
+        if (mSink != null && elem >= 0) {
+            mSink.setPierceKeepElem(elem);
+        }
         // 【点 G = 收起】和点「收」完全一样的效果。
         //   它是独立槽位，但功能上就是悬浮球本体。
         if (elem == PadLayout.I_FLOAT) {
@@ -7009,14 +7259,28 @@ public class GamepadView extends PickList {
                 mMouseAccX = 0;
                 mMouseAccY = 0;
                 mMouseMoved = false;
+                // 拖动保持按下：一按下就按住设定的键，抬手（或取消）才松。
+                int hb = holdBtnOf(elem);
+                if (hb >= 0 && mSink != null) {
+                    mSink.onMouseButton(hb, true);
+                    mHoldBtn = hb;
+                    // 缓冲窗口：等按住真正落地再发位移，否则第一下会废
+                    mHoldArming = true;
+                    removeCallbacks(mHoldArmed);
+                    postDelayed(mHoldArmed, MOUSE_PIERCE_SETTLE_MS_GUESS);
+                }
             } else {
                 int b = mouseButtonOf(elem);
-                if (b >= 0) {
+                // 保持键已经按着了，再 down 一次是多余的
+                if (b >= 0 && b != mHoldBtn) {
                     mSink.onMouseButton(b, true);
+                } else if (b >= 0 && b == mHoldBtn) {
+                    // 同键：先松开再按下，等于一次完整点击，然后保持状态继续
+                    clickWithHold(b);
                 } else {
-                    // 滚轮：没有"按住"这个概念，按一下滚一格。
-                    // 每次点都发，长按不会连发 —— 要连续滚就连续点。
+                    // 滚轮：先滚一格，按住不放就接着连发（见 startWheelRepeat）。
                     mSink.onMouseWheel(mouseWheelOf(elem));
+                    startWheelRepeat(elem, mouseWheelOf(elem));
                 }
             }
             invalidate();
@@ -7310,8 +7574,8 @@ public class GamepadView extends PickList {
                 int dy = Math.round((y - mMouseLastY) * MOUSE_SENS);
                 if (dx != 0 || dy != 0) {
                     mMouseMoved = true;
-                    if (sMouseDefer) {
-                        // 松手才发：这里一个字节都不往外发，只记账。
+                    if (sMouseDefer || mHoldArming) {
+                        // 松手才发 / 缓冲窗口：这里一个字节都不往外发，只记账。
                         // 滑动全程没有鼠标事件 = 没有"输入源变了" = 收不到 CANCEL。
                         mMouseAccX += dx;
                         mMouseAccY += dy;
@@ -7397,20 +7661,33 @@ public class GamepadView extends PickList {
     }
 
     private void onUp(int elem) {
+        // 手指抬起：手势正常结束，被保护的元素作废，让开恢复成整窗。
+        if (mSink != null) {
+            mSink.setPierceKeepElem(-1);
+        }
         if (PadLayout.isMouseSlot(elem) && mLayout != null
                 && mLayout.isMouseUsed(elem)) {
             mDown[elem] = 0;
             if (mLayout.isMousePadAt(elem)) {
-                // 双击触摸板 = 切换发送时机（测试用，好来回对比）
+                //
+                // 【轻点触摸板：单击 / 双击各能设一个动作】
+                //   默认双击 = 切换发送时机（和加这个设置之前的行为一致），
+                //   单击默认 = 无 —— 拖动里误触不该点出左键。
+                //
+                //   单击要等双击窗口过去才敢执行：不然单击会先跑一遍，
+                //   紧接着双击又跑一遍，等于点了两次。
+                //   所以单击用 postDelayed 延后 400ms，期间来了第二下就取消。
                 long now = System.currentTimeMillis();
-                if (!mMouseMoved && now - mMouseTapMs < 400) {
-                    sMouseDefer = !sMouseDefer;
+                if (!mMouseMoved && now - mMouseTapMs < DOUBLE_TAP_MS) {
+                    cancelPendingTap();
                     mMouseTapMs = 0;
-                    toastLocal(sMouseDefer
-                            ? "鼠标：松手才发（滑动中不发事件）"
-                            : "鼠标：边滑边发（实时）");
+                    runPadAct(elem, mLayout.padDbl[elem]);
                 } else if (!mMouseMoved) {
                     mMouseTapMs = now;
+                    int tapAct = mLayout.padTap[elem];
+                    if (tapAct != PadLayout.PACT_NONE) {
+                        postPendingTap(elem, tapAct);
+                    }
                 }
                 if (sMouseDefer) {
                     // 一次性把整段位移吐出去。int8 一帧最多带 127，
@@ -7429,9 +7706,18 @@ public class GamepadView extends PickList {
                 }
             } else {
                 int b = mouseButtonOf(elem);
+                // 滚轮停连发（它没有"抬起"，但要停掉长按补发的那串）
+                stopWheelRepeat();
                 // 滚轮不发抬起：它本来就没按下过
                 if (b >= 0) {
-                    mSink.onMouseButton(b, false);
+                    // 保持键不在这里抬起 —— 抬起会破坏"一直按着"的效果。
+                    // 它的抬起交给 releaseHold（手指全部离开 / 切布局时）。
+                    if (b != mHoldBtn) {
+                        mSink.onMouseButton(b, false);
+                    }
+                } else {
+                    // 抬起配对：UP / 取消都要走到这里，不然键一直按着
+                    releaseHold();
                 }
             }
             invalidate();
@@ -7526,6 +7812,15 @@ public class GamepadView extends PickList {
     private void releaseAll(boolean hardCombo) {
         mSlDrag = NONE;
         mSlDragPointer = NONE;
+        // 手势整体没了（切布局 / CANCEL / 重置），被保护的元素也一起作废，
+        // 否则让开会永远留着一块"能吃触摸"的区域。
+        if (mSink != null) {
+            mSink.setPierceKeepElem(-1);
+        }
+        // 兜底：切布局 / 重置时滚轮可能还在连发，不停会一直滚下去
+        stopWheelRepeat();
+        // 兜底：保持按下的键必须抬起，否则切布局后一直框选
+        releaseHold();
         // 兜底：组合键的延迟序列可能还在排队（切布局、重置），
         // 这里统一收掉，否则键会卡在按下状态。
         // 【序列正在播时不能硬取消】见上面 hardCombo 的说明。
@@ -7848,7 +8143,7 @@ public class GamepadView extends PickList {
                 mBallPaint, mBallRingPaint, mBallTextPaint,
                 mLayout.btnColor[i], mLayout.shape[i], mLayout.nameOf(i),
                 mLayout.labelOn(i), mLayout.textScale[i], effAlpha(i),
-                mDown[i] == 1, getResources().getDisplayMetrics().density);
+                pressedVisual(i), getResources().getDisplayMetrics().density);
     }
 
     private void drawStick(Canvas c, int i, float kx, float ky, String label) {
@@ -8019,10 +8314,54 @@ public class GamepadView extends PickList {
      *   或被别的输入源动过之后就越偏越远。
      *   而"手指走了多远"既是准确的，也正是松手模式真正缺的那条信息。
      */
+    /** 轻点动作的短名，拼进触摸板提示行里。 */
+    private static String padActShort(int act) {
+        switch (act) {
+            case PadLayout.PACT_MODE:  return "切模式";
+            case PadLayout.PACT_LEFT:  return "左键";
+            case PadLayout.PACT_RIGHT: return "右键";
+            case PadLayout.PACT_MID:   return "中键";
+            case PadLayout.PACT_WUP:   return "滚轮上";
+            case PadLayout.PACT_WDN:   return "滚轮下";
+            default:                   return "无";
+        }
+    }
+
+    /**
+     * 触摸板名字下面那几行提示（单击 / 双击各一行，设了才显示）。
+     *
+     * 【为什么不由改名来管】
+     *   home 键那种只有一行名字，改名直接把那一行换掉，没问题。
+     *   触摸板不一样：第一行是名字，下面的行是"轻点会干什么"的说明，
+     *   它应该跟着「操作」里设的值自动变，手写容易和设置对不上。
+     */
+    private String padActTip(int i) {
+        StringBuilder sb = new StringBuilder();
+        int t = mLayout.padTap[i];
+        int d = mLayout.padDbl[i];
+        if (t != PadLayout.PACT_NONE) {
+            sb.append('\n').append("单击").append(padActShort(t));
+        }
+        if (d != PadLayout.PACT_NONE) {
+            sb.append('\n').append("双击").append(padActShort(d));
+        }
+        return sb.toString();
+    }
+
     private void drawMousePad(Canvas c, int i) {
         // 原名字（用户改过名就用改过的）+ 提示行。
         // forceLabel=true 是必须的：不强制的话 customName 会把整串顶掉。
-        drawBtn(c, i, mLayout.displayName(i, "触摸板") + "\n双击切模式", true);
+        //
+        // 【提示行跟着「操作」里设的走，不再写死】
+        //   以前写死成 "双击切模式"，而双击动作现在能设成左键 / 滚轮…，
+        //   设成左键还在下面写"双击切模式"就是骗人。
+        //   改名管第一行，提示行归「操作」管 —— 两行各管各的，互不干扰。
+        // 【第2行名字有两种来源】
+        //   跟随双击操作（默认）：下面那行由「操作」里设的值自动生成；
+        //   跟随改名：不拼提示行，名字里写的 \n 就是换行，想写什么写什么。
+        drawBtn(c, i, mLayout.padTipName[i]
+                     ? mLayout.displayName(i, "触摸板")
+                     : mLayout.displayName(i, "触摸板") + padActTip(i), true);
         if (!sMouseDefer || !shouldDraw(i) || mDown[i] != 1) return;
         // 预览开关（设置里那个，默认关）。关了就不画，鼠标照常能拖。
         if (!mousePreviewOn(getContext())) return;
@@ -8351,7 +8690,7 @@ public class GamepadView extends PickList {
         setA(mBtnPaint, a);
         setA(mBtnOnPaint, a);
         setA(mRingPaint, a);
-        drawButtonBody(c, i, mDown[i] == 1 ? mBtnOnPaint : mBtnPaint);
+        drawButtonBody(c, i, pressedVisual(i) ? mBtnOnPaint : mBtnPaint);
         drawButtonOutline(c, i, mRingPaint);
         if (mLayout.labelOn(i)) {
             drawLabelScaled(c, mLayout.displayName(i, mLayout.comboName[i]),
@@ -8362,13 +8701,23 @@ public class GamepadView extends PickList {
         resetA(mRingPaint);
     }
 
+    /**
+     * 按下时给不给高亮。
+     *
+     *   由「更多选项 -> 点击反馈」逐键控制，触摸板默认关。
+     *   关掉之后按下不再换色，但功能照常 —— 它只是显示。
+     */
+    private boolean pressedVisual(int i) {
+        return mDown[i] == 1 && (mLayout == null || mLayout.fbOn(i));
+    }
+
     private void drawBlankBtn(Canvas c, int i) {
         if (!shouldDraw(i)) return;
         float a = mLayout.alpha[i];
         setA(mBtnPaint, a);
         setA(mBtnOnPaint, a);
         setA(mRingPaint, a);
-        drawButtonBody(c, i, mDown[i] == 1 ? mBtnOnPaint : mBtnPaint);
+        drawButtonBody(c, i, pressedVisual(i) ? mBtnOnPaint : mBtnPaint);
         drawButtonOutline(c, i, mRingPaint);
         resetA(mBtnPaint);
         resetA(mBtnOnPaint);
@@ -8410,7 +8759,7 @@ public class GamepadView extends PickList {
         setA(mBtnPaint, a);
         setA(mBtnOnPaint, a);
         setA(mRingPaint, a);
-        drawButtonBody(c, i, mDown[i] == 1 ? mBtnOnPaint : mBtnPaint);
+        drawButtonBody(c, i, pressedVisual(i) ? mBtnOnPaint : mBtnPaint);
         drawButtonOutline(c, i, mRingPaint);
         if (mLayout.labelOn(i)) {
             drawLabelScaled(c, forceLabel ? label : mLayout.displayName(i, label),
@@ -8635,7 +8984,7 @@ public class GamepadView extends PickList {
         }
         setA(base, a);
         setA(mRingPaint, a);
-        if (mDown[i] == 1) {
+        if (pressedVisual(i)) {
             setA(mBtnOnPaint, a);
             drawButtonBody(c, i, mBtnOnPaint);
             resetA(mBtnOnPaint);

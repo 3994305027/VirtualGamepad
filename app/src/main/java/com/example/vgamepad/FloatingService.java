@@ -1163,19 +1163,269 @@ public class FloatingService extends Service implements GamepadView.Sink {
         mLink.key(usage, pressed);
     }
 
+    /**
+     * 发鼠标事件之前先把整块悬浮窗"让开"，发完再还回来。
+     *
+     * 【为什么必须让开】
+     *   注入的鼠标是系统级指针，派发时落在最上面那个**可触摸**的窗口上。
+     *   悬浮窗铺满全屏，光标正好压在它上面 —— 移动、点击全被它吃掉，
+     *   下面的游戏一点都收不到。表现就是"鼠标像被挡在悬浮窗那儿"。
+     *
+     * 【为什么发完必须还回来】
+     *   让开期间窗口不吃触摸，触摸板的 MOVE、按键的 UP 都会丢。
+     *   所以只能短暂让开，不能一直穿透（一直穿透就什么也点不到了）。
+     *
+     * 【为什么要过一小会儿才还】
+     *   updateViewLayout 本身是同步的，但输入派发那边更新窗口信息是异步的。
+     *   立刻还回来，鼠标事件可能赶在派发器收到"不可触摸"之前就发出去了，
+     *   等于白让。所以保持一小会儿再还。
+     *
+     * 【连续发只让一次】
+     *   拖动时会连发很多条，mMousePiercing 保证只在第一次真正让开，
+     *   后面每条只把"还回来"的时间往后推 —— 一次拖动 = 一次让开 + 一次还原。
+     */
+    private boolean mMousePiercing;
+    /**
+     * 让开之后保持多久再还回来（毫秒）。
+     *
+     * 【为什么从 40 放宽到 150】
+     *   40ms 是按"本地注入"估的，实际链路是
+     *   socket -> 守护进程 -> /dev/uinput -> InputDispatcher，
+     *   这一趟常在 40ms 以上。事件到达时窗口已经还原了，
+     *   点击于是落在光标压着的那个元素上 —— 表现就是"点左键点到收"。
+     *   150ms 足够把 down / up 都罩在让开窗口里，又不至于让
+     *   按键长时间失灵（还原后立刻恢复）。
+     */
+    private static final int MOUSE_PIERCE_HOLD_MS = 150;
+    /**
+     * 第一次让开之后、真正发事件之前要等多久（毫秒）。
+     *
+     * 【为什么必须等】
+     *   让开只是"提交"：region 要等下一帧 traversal，
+     *   改 flag 要等 InputDispatcher 异步更新窗口信息。
+     *   立刻发的话，事件很可能赶在让开落地之前就出去了，等于白让。
+     *   只在"从没让开 -> 让开"这一次等；同一次操作里后续的事件
+     *   已经在让开窗口内了，照常同步发，不影响手感。
+     */
+    private static final int MOUSE_PIERCE_SETTLE_MS = 60;
+
+    private final Runnable mUnpierce = new Runnable() {
+        @Override
+        public void run() {
+            if (!mMousePiercing) {
+                return;
+            }
+            mMousePiercing = false;
+            setAllPassthrough(false);
+            // 【还原后必须主动补一次重铺】
+            //   让开期间所有重铺都被闸门放行掉了（见 mousePiercing()），
+            //   窗口会一直停在"空 region"上。不补这一次的话，
+            //   还原只是把标志翻了回来，region 实际没铺回去 ——
+            //   表现就是"点一次鼠标之后，按键就再也不接触摸了"。
+            scheduleKeySync();
+            requestRegionCommit();
+        }
+    };
+
+    /**
+     * 正在让开吗。
+     *
+     * 【为什么需要这个闸门】
+     *   让开只是"把一个状态设下去"，但代码里有好几处会**定期把它重铺回来**：
+     *     mRegionSettle   —— 5 轮 × 80ms，每轮 buildTouchRegion + apply(n)
+     *     syncKeyWindows  —— 面板关闭、布局切换、以及每次重绘都可能触发
+     *     mReapply        —— 上面那个的延迟版
+     *   而点左键本身就会因为点击反馈引发重绘，进而触发同步。
+     *   结果是：让开刚设好，下一帧就被重铺成按键矩形 —— 事件到达时
+     *   窗口早就"能吃触摸"了，于是点击落在光标压着的那个元素上。
+     *   这正是"明明让开了，还是点到收"的真因，跟保持多久无关。
+     *
+     * 所以让开必须是**闸门**而不是**一次性赋值**：让开期间任何重铺都要让路。
+     */
+    private boolean mousePiercing() {
+        return mMousePiercing;
+    }
+
+    /** 发鼠标事件之前调：让开。 */
+    private void pierceForMouse() {
+        if (!mMousePiercing) {
+            mMousePiercing = true;
+            setAllPassthrough(true);
+        }
+        mHandler.removeCallbacks(mUnpierce);
+    }
+
+    /** 发完之后调：过一小会儿还回来。 */
+    private void unpierceAfterMouse() {
+        mHandler.removeCallbacks(mUnpierce);
+        mHandler.postDelayed(mUnpierce, MOUSE_PIERCE_HOLD_MS);
+    }
+
+    /**
+     * 发一次"会命中"的鼠标事件（按键、滚轮），前后自动让开 / 还原。
+     *
+     * @param send 真正把事件写进 socket 的那一步
+     */
+    /**
+     * 待发的鼠标事件，按加入顺序排。
+     *
+     * 【为什么必须排队：down / up 会被发反】
+     *   以前是"第一次让开就延后 60ms 发，之后立即发"：
+     *     down  延后 60ms
+     *     up    立即
+     *   —— up 反而先到，down 后到。结果是键按下之后再也没抬起，
+     *   一直卡在"按着"的状态。这也正是"触摸板左键点了不松开"的由来。
+     *   排队之后两者都在队列里按序发出，先后不会颠倒。
+     */
+    private final java.util.ArrayList<Runnable> mMouseQueue =
+            new java.util.ArrayList<Runnable>();
+    private boolean mMouseFlushPosted;
+
+    private final Runnable mMouseFlush = new Runnable() {
+        @Override
+        public void run() {
+            mMouseFlushPosted = false;
+            for (int i = 0; i < mMouseQueue.size(); i++) {
+                mMouseQueue.get(i).run();
+            }
+            mMouseQueue.clear();
+        }
+    };
+
+    private void sendMouse(final Runnable send) {
+        final boolean needSettle = !mMousePiercing;
+        pierceForMouse();
+        mMouseQueue.add(send);
+        unpierceAfterMouse();
+        if (!mMouseFlushPosted) {
+            mMouseFlushPosted = true;
+            mHandler.postDelayed(mMouseFlush,
+                    needSettle ? MOUSE_PIERCE_SETTLE_MS : 0L);
+        }
+    }
+
+    /**
+     * 整块悬浮窗吃不吃触摸。
+     *
+     *   region 模式：把 touchableRegion 铺成空（没人可点 = 全穿过去），
+     *                还原时按按键矩形重新铺一遍。
+     *   （不能用 clear() —— 它是"整屏档"，正好反过来：整屏都能点。）
+     *
+     *   多窗口模式：全屏窗口和每个按键小窗口一起加 / 去 NOT_TOUCHABLE。
+     */
+    /**
+     * A 方案：让开时要**保留**的元素下标（-1 = 不保留，整窗让开）。
+     *
+     * 手指正按着的那个按钮如果也跟着整窗一起不接触摸，触摸手势会立刻被判
+     * ACTION_CANCEL，up 被提前发出 —— 长按就退化成一次单击。
+     * 把这一个留下来，其余照常让开，手势就掐不断。
+     */
+    private int mPierceKeepElem = -1;
+
+    /**
+     * GamepadView 报上来"手指当前按着谁"。
+     *
+     * 让开期间这个值变了要立刻重铺一次：pierceForMouse 只在**第一次**让开时
+     * 才真正下发（见 mMousePiercing 那个闸门），后面手指换了元素的话，
+     * 光改字段是不会生效的。
+     */
+    @Override
+    public void setPierceKeepElem(int elem) {
+        if (mPierceKeepElem == elem) {
+            return;
+        }
+        mPierceKeepElem = elem;
+        if (mMousePiercing) {
+            setAllPassthrough(true);
+        }
+    }
+
+    private void setAllPassthrough(boolean pass) {
+        if (mRegionActive && mRegionHelper != null && mPadView != null) {
+            if (pass) {
+                if (mPierceKeepElem >= 0) {
+                    // 只生成手指按着的那个元素的矩形：其余不接触摸（照常让开），
+                    // 但这一块仍能收 MOVE / UP，手势不会被掐断。
+                    int n = mPadView.buildTouchRegion(mRegionRects, mPierceKeepElem);
+                    mRegionHelper.apply(mPadView, mRegionRects, n);
+                } else {
+                    mRegionHelper.apply(mPadView, mRegionRects, 0);
+                }
+            } else {
+                int n = mPadView.buildTouchRegion(mRegionRects);
+                mRegionHelper.apply(mPadView, mRegionRects, n);
+            }
+            return;
+        }
+        setPadTouchable(!pass);
+        for (int k = 0; k < mKeyCount; k++) {
+            WindowManager.LayoutParams p = mKeyParams[k];
+            if (p == null) {
+                continue;
+            }
+            int f = p.flags;
+            if (pass && mKeyElem[k] == mPierceKeepElem) {
+                // 手指正按着这个窗口：别把它设成不接触摸，
+                // 否则手势被掐断，长按又变成单击。
+                continue;
+            }
+            if (pass) {
+                f |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            } else {
+                f &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            }
+            if (f == p.flags) {
+                continue;
+            }
+            p.flags = f;
+            if (mKeyViews[k] != null) {
+                try {
+                    mWm.updateViewLayout(mKeyViews[k], p);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
     @Override
     public void onMouseMove(int dx, int dy) {
+        // 【移动默认不让开】理由见下面注释。
+        //   但「鼠标移动时避让」这个开关打开时走旧行为（移动也让开），
+        //   用于排查"移动没穿透过去 / 点击打到自己悬浮窗"这类问题。
+        if (PadLayout.sMousePierce) {
+            // 旧行为：移动也让开。
+            //   注意不排队 —— 移动是每帧高频的，走 sendMouse 的队列会有
+            //   明显延迟。这里同步发出去即可。
+            pierceForMouse();
+            mLink.mouseMove(dx, dy);
+            unpierceAfterMouse();
+            return;
+        }
+        // 【移动不让开】
+        //   拖动时手指正压在触摸板上，一让开手指的 ACTION_MOVE 就收不到了，
+        //   实时模式会被自己打断（表现是滑动一顿一顿、甚至直接断流）。
+        //   而且 MOVE 只是挪指针、不做命中判定，用不着让开。
         mLink.mouseMove(dx, dy);
     }
 
     @Override
-    public void onMouseButton(int btn, boolean pressed) {
-        mLink.mouseButton(btn, pressed);
+    public void onMouseButton(final int btn, final boolean pressed) {
+        sendMouse(new Runnable() {
+            @Override
+            public void run() {
+                mLink.mouseButton(btn, pressed);
+            }
+        });
     }
 
     @Override
-    public void onMouseWheel(int notches) {
-        mLink.mouseWheel(notches);
+    public void onMouseWheel(final int notches) {
+        sendMouse(new Runnable() {
+            @Override
+            public void run() {
+                mLink.mouseWheel(notches);
+            }
+        });
     }
 
     /**
@@ -1619,6 +1869,13 @@ public class FloatingService extends Service implements GamepadView.Sink {
                 Log.w(TAG, "settle: 又回到 want=false，停止收敛");
                 return;
             }
+            if (mousePiercing()) {
+                // 让开期间收敛任务不能重铺按键区，否则让开被取消。
+                // 不递增计数、原样延后，让开结束后自然接管。
+                mHandler.removeCallbacks(mRegionSettle);
+                mHandler.postDelayed(mRegionSettle, REGION_SETTLE_DELAY_MS);
+                return;
+            }
             if (mRegionHelper != null) {
                 int n = mPadView.buildTouchRegion(mRegionRects);
                 if (n > 0) {
@@ -1717,7 +1974,9 @@ public class FloatingService extends Service implements GamepadView.Sink {
                 Log.w(TAG, "region: 没有可用矩形，回退多窗口");
                 return false;
             }
-            mRegionActive = mRegionHelper.apply(mPadView, mRegionRects, n);
+            // 让开期间不能铺按键区，否则把让开取消掉（见 mousePiercing()）
+            final int applyCount = mousePiercing() ? 0 : n;
+            mRegionActive = mRegionHelper.apply(mPadView, mRegionRects, applyCount);
             Log.w(TAG, "region: apply n=" + n + " -> mRegionActive=" + mRegionActive);
             if (!mRegionActive) {
                 // 第 1 级这次没成，先别急着认命降级 ——
@@ -1932,6 +2191,12 @@ public class FloatingService extends Service implements GamepadView.Sink {
         p.gravity = Gravity.TOP | Gravity.LEFT;
         p.x = l;
         p.y = t;
+        // 让开期间新建的窗口也得是"不吃触摸"的。
+        // 同步流程可能在让开窗口内补建窗口，默认 flag 是可触摸 ——
+        // 不在这里挡一下，新窗口会成为让开的一个漏洞。
+        if (mousePiercing()) {
+            p.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        }
         try {
             mWm.addView(v, p);
         } catch (Exception ignored) {
@@ -1984,6 +2249,12 @@ public class FloatingService extends Service implements GamepadView.Sink {
         //   改成只看 mRegionActive —— 它才是"这一刻真的在走 region 方案"。
         if (mRegionActive) {
             return;
+        }
+        // 让开期间一律保持不吃触摸。
+        // 多窗口模式下同步流程会顺手把 flag 设回可触摸，
+        // 不挡这一下，让开在 region 之外的那条路上照样会被取消。
+        if (mousePiercing()) {
+            touchable = false;
         }
         if (mPadParams == null) {
             return;

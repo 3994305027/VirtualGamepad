@@ -1015,9 +1015,21 @@ public class MainActivity extends Activity {
         et.setText(currentName == null ? "" : currentName);
         et.setSingleLine(true);
         et.selectAll();
+        // 【改名里写 \n 就是换行】
+        //   输入法打不出真正的回车（输入框是单行），所以用两个字符 \n
+        //   当换行记号，确定时替换成真换行 —— 名字就能写成两行、三行。
+        //   这条规则必须在这里写明，不然用户不知道有这回事。
+        final android.widget.TextView tip = new android.widget.TextView(this);
+        tip.setText("想让名字分两行，就在中间写 \\n（反斜杠加 n），确定后会自动变成换行。");
+        tip.setTextSize(13f);
+        tip.setPadding(20, 8, 20, 4);
+        android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        box.addView(tip);
+        box.addView(et);
         new android.app.AlertDialog.Builder(this)
                 .setTitle("按键改名")
-                .setView(et)
+                .setView(box)
                 .setNegativeButton("取消", new android.content.DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(android.content.DialogInterface d, int which) {
@@ -1028,6 +1040,10 @@ public class MainActivity extends Activity {
                     @Override
                     public void onClick(android.content.DialogInterface d, int which) {
                         String n = et.getText().toString().trim();
+                        // 字面 \n（反斜杠 + n）-> 真换行，让名字能分多行。
+                        if (n.indexOf("\\n") >= 0) {
+                            n = n.replace("\\n", "\n");
+                        }
                         // 空串 = "改回默认名"（displayName 见空就退回默认），
                         // 所以这里照写，不做非空过滤。
                         FloatingService.notifyKeyRenamed(elem, n);
