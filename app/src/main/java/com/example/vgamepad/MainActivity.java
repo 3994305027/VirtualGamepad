@@ -2368,6 +2368,11 @@ public class MainActivity extends Activity {
         }
         setStatusText("正在检查更新…");
 
+        if (isActionsBuild()) {
+            checkUpdateActions(true);       // 自构建版：先比仓库，再（可选）查正式版
+            return;
+        }
+
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -2418,6 +2423,315 @@ public class MainActivity extends Activity {
             }
         }
         return out.isEmpty() ? null : out;
+    }
+
+    /* ================= 自构建版（.actions）的仓库更新检查 ================= */
+
+    /*
+      【这套是给谁用的】
+        包名以 .actions 结尾的安装包 = GitHub Actions 从仓库编出来的自构建版。
+        它本来就是从仓库源码编的，再去查"正式版 Release"意义不大 ——
+        所以改成比对**仓库里的更新日志**跟**本地自带的那份**，
+        有实质差异就说明仓库往前走了，弹窗只列差异部分。
+
+      【为什么不下载、只有"打开仓库"】
+        自构建版要更新，是自己再跑一次 Actions（或者下 Actions 的产物），
+        不是从 Release 下 APK。所以这里不给网盘、不给 APK 直链 —— 给了反而是误导。
+    */
+
+    /** 仓库里的更新日志原文。文件名是中文，URL 里必须百分号编码。 */
+    private static final String REPO_LOG_URLS[] = {
+            "https://cdn.jsdelivr.net/gh/3994305027/VirtualGamepad@main"
+                    + "/app/src/main/assets/%E6%9B%B4%E6%96%B0%E6%97%A5%E5%BF%97.txt",
+            "https://raw.githubusercontent.com/3994305027/VirtualGamepad/main"
+                    + "/app/src/main/assets/%E6%9B%B4%E6%96%B0%E6%97%A5%E5%BF%97.txt",
+    };
+
+    /** 是否"顺带也查正式版"。默认关 —— 自构建版看仓库就够了。 */
+    private static final String PREF_CHECK_OFFICIAL = "check_official_update";
+    private static final boolean CHECK_OFFICIAL_DEFAULT = false;
+
+    private boolean checkOfficialEnabled() {
+        return getSharedPreferences(PREF_SET, MODE_PRIVATE)
+                .getBoolean(PREF_CHECK_OFFICIAL, CHECK_OFFICIAL_DEFAULT);
+    }
+
+    private void setCheckOfficial(boolean on) {
+        getSharedPreferences(PREF_SET, MODE_PRIVATE).edit()
+                .putBoolean(PREF_CHECK_OFFICIAL, on).apply();
+    }
+
+    /** 包名以 .actions 结尾 = Actions 自构建版。 */
+    private boolean isActionsBuild() {
+        String p = getPackageName();
+        return p != null && p.endsWith(".actions");
+    }
+
+    /**
+     * 拿仓库里的更新日志跟本地那份比，返回**多出来的那部分**原文。
+     *
+     * 【什么算"有效的变化"】
+     *   归一化（去 \r、去首尾空格、连续空白压成一个）之后完全一样
+     *   = 只改了空格 / 回车 / 换行位置，不算更新，返回空串。
+     *
+     * 【返回哪些行】
+     *   仓库里有、本地没有的行（按归一化后的内容比对），保持仓库里的顺序。
+     *   因为日志是"新的在前"，这些行就是新增的条目。
+     *   只删不改（本地没有多出来的行）时返回空串 —— 那种情况没什么可给用户看的。
+     *
+     * @return 差异文本；没有实质更新返回 ""。
+     */
+    private String diffRepoChangelog() {
+        String remote = null;
+        for (String base : REPO_LOG_URLS) {
+            remote = fetchText(base + "?t=" + System.currentTimeMillis());
+            if (remote != null && remote.length() > 0 && remote.charAt(0) != '（') {
+                break;
+            }
+            remote = null;
+        }
+        if (remote == null || remote.length() == 0) {
+            return "";
+        }
+
+        String local = readAssetText("更新日志.txt");
+        if (local.length() == 0 || local.charAt(0) == '（') {
+            return "";      // 本地那份读不出来就没法比，别误报
+        }
+
+        // 只有空白差异 -> 不是更新
+        if (normalizeLog(local).equals(normalizeLog(remote))) {
+            return "";
+        }
+
+        java.util.HashSet<String> localSet = new java.util.HashSet<String>();
+        for (String l : local.split("\n")) {
+            String t = normLine(l);
+            if (t.length() > 0) {
+                localSet.add(t);
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        int shown = 0;
+        int hidden = 0;
+        for (String l : remote.split("\n")) {
+            String t = normLine(l);
+            if (t.length() == 0) {
+                continue;
+            }
+            if (localSet.contains(t)) {
+                continue;
+            }
+            // 差异可能很长（比如本地那份已经很旧），截一刀免得刷屏
+            if (shown >= 60) {
+                hidden++;
+                continue;
+            }
+            sb.append(l.trim()).append('\n');
+            shown++;
+        }
+        if (hidden > 0) {
+            sb.append("\n…（还有 ").append(hidden).append(" 行未显示）\n");
+        }
+        return sb.toString().trim();
+    }
+
+    /** 归一整篇：逐行压平空白，用于判断"是不是只改了空格回车"。 */
+    private static String normalizeLog(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (String l : s.split("\n")) {
+            String t = normLine(l);
+            if (t.length() > 0) {
+                sb.append(t).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 归一一行：\r 当空格、去首尾、连续空白压成一个。 */
+    private static String normLine(String l) {
+        return l.replace('\r', ' ').trim().replaceAll("\\s+", " ");
+    }
+
+    /** 纯文本 GET。失败返回 null（不抛）。 */
+    private String fetchText(String urlStr) {
+        java.net.HttpURLConnection c = null;
+        try {
+            c = (java.net.HttpURLConnection) new java.net.URL(urlStr).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setRequestMethod("GET");
+            c.setInstanceFollowRedirects(true);
+            if (c.getResponseCode() != 200) {
+                return null;
+            }
+            return readAll(c.getInputStream());
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (c != null) {
+                c.disconnect();
+            }
+        }
+    }
+
+    /**
+     * 自构建版的检查更新。
+     *
+     * 【顺序】
+     *   ① 比对仓库更新日志 —— 有差异就弹"仓库有更新"，结束；
+     *   ② 仓库没更新、且开了「同时检查正式版更新」才去查正式版；
+     *   ③ 两边都没有 -> 提示已是最新（静默模式则什么都不弹）。
+     *
+     * 仓库有更新时**优先显示仓库的**，不再往下查正式版 ——
+     * 你都是自己编的了，仓库的进度才是你关心的。
+     */
+    private void checkUpdateActions(final boolean silent) {
+        final android.app.ProgressDialog pd;
+        if (silent) {
+            pd = null;
+            setStatusText("正在检查更新…");
+        } else {
+            pd = new android.app.ProgressDialog(this);
+            pd.setMessage("正在检查更新…");
+            pd.setCancelable(true);
+            pd.show();
+        }
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String diff = diffRepoChangelog();
+                // 仓库已经有更新了就不必再查正式版；没开那个开关也不查
+                final UpdateInfo info = (diff.length() > 0 || !checkOfficialEnabled())
+                        ? null : fetchUpdate();
+
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (silent) {
+                            setStatusText("");
+                        } else {
+                            try {
+                                pd.dismiss();
+                            } catch (Exception ignored) {
+                            }
+                        }
+
+                        if (diff.length() > 0) {
+                            showRepoUpdateDialog(diff);
+                            return;
+                        }
+                        if (!checkOfficialEnabled()) {
+                            if (!silent) {
+                                toast("仓库无更新，已是最新");
+                            }
+                            return;
+                        }
+                        if (info == null) {
+                            if (!silent) {
+                                toast("检查更新失败：连不上，请检查网络");
+                            }
+                            return;
+                        }
+                        if (info.code <= currentVersionCode()) {
+                            if (!silent) {
+                                toast("已是最新版本（" + info.name + "）");
+                            }
+                            return;
+                        }
+                        java.util.ArrayList<UpdateInfo> newer = filterNewer(info.list);
+                        if (newer != null) {
+                            showUpdateDialog(newer);
+                        } else {
+                            showUpdateDialog(info);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * 「仓库有更新」弹窗：只列差异出来的那些更新文本。
+     *
+     * 【为什么没有网盘 / APK 直链】
+     *   自构建版要更新是自己再跑一次 Actions，不是下 Release 的 APK。
+     *   所以只留「打开仓库」，点了去仓库页面（Actions 产物在那儿）。
+     */
+    private void showRepoUpdateDialog(String diff) {
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (16 * d);
+
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.setPadding(pad, (int) (6 * d), pad, pad);
+
+        final int maxH = (int) (getResources().getDisplayMetrics().heightPixels * 0.50);
+        android.widget.ScrollView sv = new android.widget.ScrollView(this) {
+            @Override
+            protected void onMeasure(int wms, int hms) {
+                super.onMeasure(wms,
+                        android.view.View.MeasureSpec.makeMeasureSpec(
+                                maxH, android.view.View.MeasureSpec.AT_MOST));
+            }
+        };
+        android.widget.TextView tv = new android.widget.TextView(this);
+        tv.setText(diff);
+        tv.setTextSize(13f);
+        tv.setTextColor(0xFF333333);
+        sv.addView(tv);
+        root.addView(sv, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        android.widget.LinearLayout btns = new android.widget.LinearLayout(this);
+        btns.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        btns.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        btns.setPadding(0, (int) (10 * d), 0, 0);
+
+        addDlButton(btns, "打开仓库", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUrl(URL_REPO);
+            }
+        });
+
+        android.view.View spacer = new android.view.View(this);
+        btns.addView(spacer,
+                new android.widget.LinearLayout.LayoutParams(0, 0, 1f));
+
+        final android.widget.Button later = new android.widget.Button(this);
+        later.setText("以后再说");
+        later.setTextSize(11f);
+        later.setAllCaps(false);
+        later.setBackgroundColor(0x00000000);
+        later.setTextColor(0xFF555555);
+        later.setMinWidth(0);
+        later.setMinimumWidth(0);
+        later.setSingleLine(false);
+        later.setMaxLines(2);
+        later.setEllipsize(null);
+        int lh = (int) (5 * d);
+        int lhp = (int) (4 * d);
+        later.setPadding(lhp, lh, lhp, lh);
+        btns.addView(later);
+
+        root.addView(btns, new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+                .setTitle("仓库有更新")
+                .setView(root)
+                .show();
+        later.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                dlg.dismiss();
+            }
+        });
     }
 
     /** 改标题右边那行状态字。传空串就隐藏。 */
@@ -2541,6 +2855,10 @@ public class MainActivity extends Activity {
      * 合规声明里写的是"仅用户主动点击时联网"，所以不做启动时自动查。
      */
     private void checkUpdate() {
+        if (isActionsBuild()) {
+            checkUpdateActions(false);
+            return;
+        }
         final android.app.ProgressDialog pd = new android.app.ProgressDialog(this);
         pd.setMessage("正在检查更新…");
         pd.setCancelable(true);
@@ -3802,6 +4120,37 @@ public class MainActivity extends Activity {
         tip2.setTextColor(0xFF666666);
         box.addView(tip2);
 
+        /*
+          【只在自构建版显示「同时检查正式版更新」】
+            正式版本来查的就是正式版，这个开关对它没意义，不显示。
+            自构建版（包名 .actions）默认只比仓库里的更新日志 ——
+            你都是自己从仓库编的了，仓库的进度才是你关心的。
+            想顺带看一眼正式版发没发新版，就勾上这个。
+        */
+        final android.widget.CheckBox[] cbOff = new android.widget.CheckBox[1];
+        if (isActionsBuild()) {
+            android.view.View div2 = new android.view.View(this);
+            div2.setBackgroundColor(0xFFDDDDDD);
+            box.addView(div2, new android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                    (int) (1 * d)));
+
+            cbOff[0] = new android.widget.CheckBox(this);
+            cbOff[0].setText("同时检查正式版更新");
+            cbOff[0].setChecked(checkOfficialEnabled());
+            cbOff[0].setTextSize(14f);
+            box.addView(cbOff[0]);
+
+            android.widget.TextView tip3 = new android.widget.TextView(this);
+            tip3.setText("本版是 Actions 自构建版，默认只比对仓库里的更新日志，"
+                    + "有差异就弹「仓库有更新」（只列差异部分，不给下载链接）。"
+                    + "\n勾选后，仓库没更新时会再去查一次正式版。"
+                    + "\n两边都有更新时，优先显示仓库的。");
+            tip3.setTextSize(11f);
+            tip3.setTextColor(0xFF666666);
+            box.addView(tip3);
+        }
+
         new android.app.AlertDialog.Builder(this)
                 .setTitle("设置")
                 .setView(box)
@@ -3811,8 +4160,10 @@ public class MainActivity extends Activity {
                             public void onClick(android.content.DialogInterface dlg, int w) {
                                 setAutoUpdate(cb.isChecked());
                                 setMousePreview(cbPrev.isChecked());
-                                toast(cb.isChecked() ? "已开启自动检查更新"
-                                        : "已关闭自动检查更新");
+                                if (cbOff[0] != null) {
+                                    setCheckOfficial(cbOff[0].isChecked());
+                                }
+                                toast("设置已保存");
                             }
                         })
                 .setNegativeButton("取消", null)
