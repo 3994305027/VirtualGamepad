@@ -10,17 +10,45 @@ android {
     // targetSdk 升到 30+ 会触发包可见性限制、后台启动前台服务受限等一堆问题，
     // 本工程靠的正是前台服务 + 悬浮窗，所以这里**刻意**保持 28 不动。
     compileSdkVersion 33
+    // 【buildTools 保持 33.0.1，别改小】
+    // 31.0.0 起 Google 删掉了 dx（只留 d8/r8），而 AGP 4.1.0 的部分任务仍要调它，
+    // 会报 "Build-tool xx is missing DX" → "Installed Build Tools is corrupted"。
+    // 解决方式是 CI 里把 30.0.3 的 dx 补进 33.0.1 目录（见 main.yml），
+    // **而不是**把这里降成 30.0.3 —— aapt2 版本跟着 build-tools 走，
+    // 降了就会用 30.0.3 的 aapt2 去编 compileSdk 33 的资源和 manifest，
+    // 产物跟本地 AIDE（用 33.0.1）编出来的不再一致。
     buildToolsVersion "33.0.1"
 
     defaultConfig {
         applicationId "com.example.vgamepad"
+        /*
+          【自构建版加 .actions 后缀】
+            GitHub Actions 编译时传 -PactionsBuild（见 .github/workflows/main.yml），
+            这里就给包名加后缀，编出来的是 com.example.vgamepad.actions，
+            可以和正式版共存安装，互不影响。
+
+            本地 / AIDE 正常编不传这个参数，包名仍是 com.example.vgamepad，
+            跟以前一字不差。
+
+          【为什么用 project.hasProperty 而不是在 CI 里 sed 改文件】
+            CI 里那套"自愈"会就地改这个文件（buildToolsVersion、useAndroidX），
+            用 sed 加的行有可能被改掉；而 -P 是构建参数，不碰文件本身，最稳。
+
+          【manifest 里的 Shizuku authority 不用管】
+            那边写的是 ${applicationId}.shizuku 占位符，会自动跟着变成
+            com.example.vgamepad.actions.shizuku —— 两个版本各注册各的，
+            不抢同一个 authority，Shizuku 都能认。
+        */
+        if (project.hasProperty('actionsBuild')) {
+            applicationIdSuffix ".actions"
+        }
         minSdkVersion 26
         targetSdkVersion 28
         // 版本号 = 更新时间，格式 年.月.日.时.分
         // versionCode 是 int，上限 2147483647，
         // 用「距 2026-01-01 的分钟数」，比直接拼 2609241317（已溢出）稳妥
-        versionCode 410101
-        versionName "26.10.12.19.01"
+        versionCode 410315
+        versionName "26.10.12.23.06"
     }
 
     compileOptions {
