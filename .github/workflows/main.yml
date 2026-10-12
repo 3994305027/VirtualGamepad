@@ -1,0 +1,141 @@
+name: Build APK
+
+# 触发时机：
+#   push 到 main/master      → 编译并上传 APK 压缩包
+#   push tag（v* 开头）      → 额外自动建一个 Release
+#   pull request             → 只编译，验证能不能过
+#   手动（Actions 页面点 Run）→ 随时可跑
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Assemble APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 打 tag 时要建 Release，需要写权限
+
+    env:
+      # gradle.properties 里写的是 -Xmx1024m，CI 上偏小容易 OOM，这里覆盖
+      GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # AGP 4.1.0 + Gradle 6.7.1 用 JDK 11 是官方兼容组合。
+      # 别用 JDK 17/21：Gradle 6.x 在 17+ 上会报 Unsupported class file major version。
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      # GitHub 的 ubuntu 镜像只预装了一部分 SDK，
+      # 本项目 compileSdk 33 / buildTools 33.0.1，得显式装。
+      # 新镜像用 cmdline-tools，老镜像用 tools，两个路径都找一遍。
+      - name: Install Android SDK packages
+        run: |
+          set -e
+          SDKMANAGER=""
+          for p in \
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/tools/bin/sdkmanager" ; do
+            if [ -x "$p" ]; then SDKMANAGER="$p"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::找不到 sdkmanager，请检查 runner 镜像"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platforms;android-33" \
+            "build-tools;33.0.1" \
+            "platform-tools"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      # Debug APK：用 Gradle 自带的 debug key 签名，下载下来能直接装。
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # Release APK：没配签名的话出来的是 -unsigned.apk（装不上，仅留档）。
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # —— 可选：正式签名 ——
+      # 不配 secrets 就整段跳过，不影响上面两步。
+      # 去仓库 Settings → Secrets → New repository secret 加这四个：
+      #   KEYSTORE_BASE64      keystore 文件内容 base64
+      #                        （本地跑：base64 -w0 my.keystore）
+      #   KEYSTORE_PASSWORD    密钥库密码
+      #   KEY_ALIAS            别名
+      #   KEY_PASSWORD         别名密码
+      - name: Sign release APK
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          BT="$ANDROID_HOME/build-tools/33.0.1"
+          [ -d "$BT" ] || BT="$ANDROID_SDK_ROOT/build-tools/33.0.1"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+          "$BT/zipalign" -f 4 \
+            app/build/outputs/apk/release/app-release-unsigned.apk \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/keystore.jks" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$KEYSTORE_PASSWORD" \
+            --key-pass pass:"$KEY_PASSWORD" \
+            --out "$RUNNER_TEMP/signed.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify "$RUNNER_TEMP/signed.apk"
+          cp "$RUNNER_TEMP/signed.apk" \
+            app/build/outputs/apk/release/app-release-signed.apk
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: ignore
+
+      # 只有 push tag（v*）时才建 Release。
+      # 打 tag 的方式：git tag v26.9.27.22.05 && git push origin v26.9.27.22.05
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
