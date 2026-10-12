@@ -53,13 +53,20 @@
 
         <!-- Shizuku SDK 的入口。没有它 Shizuku.pingBinder() 永远返回 false，
              因为拿不到 Shizuku 服务回传的 Binder。
-               authorities 必须全局唯一，所以用 applicationId 前缀。
+               Shizuku Manager 是按「app 包名 + .shizuku」来 call 这个 provider 的，
+               所以 authority 必须跟 applicationId 严格对应。
+               这里用 ${applicationId} 占位符（构建时自动替换），而不是把包名写死：
+               写死的话一旦改 applicationId 做共存版，Manager 会去找「新包名.shizuku」，
+               而这里注册的还是旧串 → Binder 拿不到 → pingBinder() 一直 false
+               → 表现成"Shizuku 没启动"、点自动激活不弹授权框、列表里也看不到本 app。
+               用占位符后，原版解析为 com.example.vgamepad.shizuku（与原来完全一致），
+               共存版各自解析成自己的包名，互不冲突。
                android:permission 那行是官方要求的写法，用来阻止普通 app
                访问这个 provider（它是系统权限，第三方拿不到，所以等于只对
-               Shizuku 自己开放）。改动 applicationId 时这里要同步改。 -->
+               Shizuku 自己开放）。 -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="com.example.vgamepad.shizuku"
+            android:authorities="${applicationId}.shizuku"
             android:multiprocess="false"
             android:enabled="true"
             android:exported="true"
@@ -90,7 +97,7 @@
              如果哪天要切回零依赖的手写客户端（ShizukuClient.java 还留在工程里），
              把上面 rikka.shizuku.ShizukuProvider 这段换回下面这段即可：
                  <provider android:name=".ShizukuProvider"
-                     android:authorities="com.example.vgamepad.shizuku"
+                     android:authorities="${applicationId}.shizuku"
                      android:multiprocess="false" android:enabled="true"
                      android:exported="true"
                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
