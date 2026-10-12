@@ -16,6 +16,9 @@
 
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 点击反馈要用到震动。没这条时 Vibrator 对象照样拿得到，
+         但 vibrate() 会静默失败，表现是"开了震动却没反应"。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- 必须有：Android 上 app 创建 socket 需要 INTERNET 权限，
          即使是连 127.0.0.1。没有它 connect() 会抛
