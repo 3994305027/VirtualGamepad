@@ -320,6 +320,32 @@ jobs:
             && echo "检测到 :app 模块" \
             || echo "::error::gradle projects 里没有 :app —— settings.gradle 仍未生效"
 
+      # 【自构建版改显示名】
+      #   只在 CI 里改，不动仓库里的源文件 —— 正式版包名/名字都保持原样。
+      #   做法就是给 strings.xml 里的 app_name 左右各加一个短横：
+      #     正式版   Virtual Gamepad
+      #     自构建版 -Virtual Gamepad-
+      #   桌面图标和应用列表里一眼能分清装的是哪一个。
+      #
+      #   只改 res/values 这一份（工程没有其它语言的 values 目录），
+      #   改完立刻回读校验，改不动就报 warning 而不是让构建挂掉。
+      - name: Mark Actions build (app label)
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          f="app/src/main/res/values/strings.xml"
+          if [ ! -f "$f" ]; then
+            echo "::warning::没找到 $f，跳过改名（自构建版名字会和正式版一样）"
+            exit 0
+          fi
+          sed -i 's|<string name="app_name">[^<]*</string>|<string name="app_name">-Virtual Gamepad-</string>|' "$f"
+          if grep -q '>-Virtual Gamepad-<' "$f"; then
+            echo "应用名已改为: -Virtual Gamepad-"
+          else
+            echo "::warning::改名没生效（app_name 那行的写法可能不是标准格式），保持原名"
+          fi
+          grep -n 'app_name' "$f"
+
       # 不用 --stacktrace：它会打出几百行堆栈，把整个 job 日志撑到被 GitHub 截断
       #
       # 【-PactionsBuild】
