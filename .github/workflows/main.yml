@@ -239,6 +239,24 @@ jobs:
             echo "已补: $(grep -o 'buildToolsVersion \"[^\"]*\"' "$BG" | head -1)" | tee -a "$DIAG"
           fi
 
+          # ④c gradle.properties 自愈 —— 症状：
+          #   "This project uses AndroidX dependencies, but the
+          #    'android.useAndroidX' property is not enabled"
+          # 原因：Shizuku API 13.1.5 间接依赖 androidx.annotation:annotation:1.3.0，
+          #   AGP 要求显式声明 useAndroidX=true 才允许带 androidx 依赖。
+          echo "===== gradle.properties 体检 =====" | tee -a "$DIAG"
+          GP="$PROJ/gradle.properties"
+          if [ ! -f "$GP" ]; then
+            echo "::warning::gradle.properties 不存在，自动补（useAndroidX=true）"
+            printf 'org.gradle.jvmargs=-Xmx1024m\nandroid.useAndroidX=true\nandroid.enableJetifier=false\n' > "$GP"
+          elif grep -q '^[[:space:]]*android\.useAndroidX[[:space:]]*=[[:space:]]*false' "$GP"; then
+            echo "::warning::android.useAndroidX=false，自动改为 true"
+            sed -i 's/^[[:space:]]*android\.useAndroidX[[:space:]]*=.*/android.useAndroidX=true/' "$GP"
+          fi
+          if [ -f "$GP" ]; then
+            grep -n "useAndroidX\|enableJetifier" "$GP" | tee -a "$DIAG"
+          fi
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
